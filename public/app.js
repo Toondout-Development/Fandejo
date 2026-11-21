@@ -65,41 +65,104 @@ const confirmDo = (msg, fn) => modal(`<h3>Confirm</h3><p>${esc(msg)}</p>`, fn);
 /* ---------- boot / login ---------- */
 async function boot() {
     const s = await (await fetch('api.php?a=session')).json();
-    if (!s.auth) return loginView();
+    if (!s.auth) return loginView(s);
     csrf = (await (await fetch('api.php?a=csrf')).json()).csrf;
-    S.driver = s.driver; S.user = s.user;
+    S.driver = s.driver; S.user = s.user; S.sqliteDirs = s.sqlite_dirs || [];
     await loadDbs(); layout();
 }
-function loginView() {
+function loginView(s = {}) {
+    const needSetup = !!s.sqlite_setup;
+    const dirs = (s.sqlite_dirs || []).join(', ') || 'data/';
     $('#app').innerHTML = `<div class="login"><form class="card" id="lf"><div class="brand-mark">${LOGO_SVG}<h1>Fandejo</h1></div><span style="color:var(--mute)">A modern foundry for MariaDB, MySQL, and SQLite3</span>
-    <label>Engine<select name="driver"><option value="mysql">MySQL / MariaDB</option><option value="sqlite">SQLite3</option></select></label>
-    <div id="my"><label>Host<input name="host" value="127.0.0.1"></label><label>Port<input name="port" value="3306"></label>
-    <label>Username<input name="user" value="root"></label><label>Password<input name="pass" type="password"></label></div>
-    <label id="sq" hidden>Database file path<input name="path" placeholder="/path/to/db.sqlite"></label>
-    <button class="primary">Sign in</button></form></div>`;
+    <label>Engine<select name="driver"><option value="mysql">MySQL / MariaDB</option><option value="sqlite">SQLite3 (Sandboxed Catalog)</option></select></label>
+    <div id="my"><label>Host<input name="host" value="127.0.0.1"></label><label>Port<input name="port" value="3306"></label></div>
+    <div id="sq" hidden>
+      <div class="msg" style="margin:0;font-size:12px">
+        <b>SQLite Directory Sandbox:</b><br><code style="word-break:break-all">${esc(dirs)}</code>
+        ${needSetup ? `<br><span style="color:var(--accent)">First-time SQLite setup: enter an admin username & password below to initialize <code>config.php</code> with an Argon2id hash.</span>` : ''}
+      </div>
+      ${needSetup ? `<input type="hidden" name="setup_sqlite" value="1">` : ''}
+    </div>
+    <label>Username<input name="user" value="${needSetup ? 'admin' : 'root'}" required></label>
+    <label>Password<input name="pass" type="password" placeholder="${needSetup ? 'Min 6 characters for SQLite setup' : ''}"></label>
+    <button class="primary" id="lbtn">Sign in</button></form></div>`;
     const f = $('#lf');
-    f.driver.onchange = () => { $('#my').hidden = f.driver.value === 'sqlite'; $('#sq').hidden = f.driver.value !== 'sqlite'; };
+    f.driver.onchange = () => {
+        const isSq = f.driver.value === 'sqlite';
+        $('#my').hidden = isSq;
+        $('#sq').hidden = !isSq;
+        if (isSq && f.user.value === 'root') f.user.value = 'admin';
+        else if (!isSq && f.user.value === 'admin') f.user.value = 'root';
+        $('#lbtn').textContent = isSq && needSetup ? 'Initialize SQLite Auth & Sign in' : 'Sign in';
+    };
     f.onsubmit = guard(async e => { e.preventDefault(); const r = await api('login', Object.fromEntries(new FormData(f))); csrf = r.csrf; await boot(); });
 }
 async function loadDbs() {
     const [dRes, mRes] = await Promise.all([api('databases'), S.meta ? Promise.resolve(S.meta) : api('server_meta').catch(() => null)]);
     S.dbs = dRes.databases.map(d => typeof d === 'string' ? { name: d } : d);
     if (mRes) S.meta = mRes;
-    if (S.driver === 'sqlite') await loadTables('main');
+    if (S.db && !S.dbs.some(d => d.name === S.db)) { S.db = null; S.table = null; }
 }
 async function loadTables(db) { S.tables[db] = (await api('tables', { db })).tables; }
 
 /* ---------- layout ---------- */
+function promptNewDb() {
+    const my = S.driver === 'mysql';
+    const dirs = S.sqliteDirs || [];
+    modal(`<h3>New ${my ? 'database' : 'SQLite database file'}</h3>
+      ${!my && dirs.length > 1 ? `<label>Target Sandbox Directory<select name="dir_idx">${dirs.map((d, i) => `<option value="${i}">${esc(d)}</option>`).join('')}</select></label>` : ''}
+      <label>${my ? 'Name' : 'File name'}<input name="name" placeholder="${my ? 'my_database' : 'app_data.sqlite'}" required autofocus></label>
+      ${my ? `<label>Default Collation<select name="collation">${collSelectOpts(getPrefs().collation)}</select></label>`
+           : `<small style="color:var(--mute)">Created inside ${dirs.length > 1 ? 'the selected' : 'sandbox'} directory (<code>.sqlite</code> added automatically if omitted).</small>`}`, async v => {
+        if (!my && v.dir_idx && +v.dir_idx > 0) v.name = `@${v.dir_idx}:${v.name}`;
+        const r = await api('create_db', v);
+        await loadDbs();
+        S.db = (!my && v.dir_idx && +v.dir_idx > 0) ? `@${v.dir_idx}:${r.name}` : (r.name || v.name);
+        S.table = null; S.tab = 'tables';
+        await loadTables(S.db); layout(); toast('Database created');
+    });
+}
+async function manageSqliteDirs() {
+    const r = await api('sqlite_dirs');
+    modal(`<div style="width:min(640px,85vw)"><h3>📁 Manage SQLite Sandbox Directories</h3>
+      <p style="color:var(--mute);font-size:12px;margin-top:0">Fandejo treats these directories as your SQLite database catalog. Only <code>.sqlite</code>, <code>.sqlite3</code>, and <code>.db</code> files directly inside these folders can be accessed.</p>
+      <div id="sd-list"></div>
+      <button type="button" id="sd-add" style="margin:6px 0 12px">+ Add directory path</button>
+      <label class="pc"><input type="checkbox" name="create_missing" checked><span>Create missing directories</span><small>Automatically mkdir any new directory path if it does not exist yet</small></label>
+      <div class="msg" style="margin-top:10px;font-size:12px">Note: For SQLite to run transactions in WAL/journal mode, the PHP process must have write permission on both the <code>.sqlite</code> file and its parent directory.</div>
+    </div>`, async f => {
+        const dirs = [...$('#sd-list').querySelectorAll('input.sd-inp')].map(i => i.value.trim()).filter(Boolean);
+        const res = await api('set_sqlite_dirs', { dirs, create_missing: !!f.create_missing });
+        S.sqliteDirs = res.dirs;
+        await loadDbs();
+        layout();
+        toast('SQLite sandbox directories updated');
+    });
+    const host = $('#sd-list');
+    const addRow = (d = { path: '', exists: null }) => {
+        const row = document.createElement('div');
+        row.className = 'rl-row';
+        row.style.marginBottom = '6px';
+        const badge = d.exists === null ? ''
+            : !d.exists ? `<span class="badge warn" title="Directory does not exist">missing</span>`
+            : `<span class="badge ${d.writable ? '' : 'warn'}" title="${d.writable ? 'Readable & writable' : 'Read-only for PHP'}">${d.files} db · ${d.writable ? 'rw' : 'ro'}</span>`;
+        row.innerHTML = `<input class="sd-inp" value="${esc(d.path)}" placeholder="/var/www/data" style="flex:1;font-family:ui-monospace,monospace">${badge}<button type="button" class="ghost danger" title="Remove directory">✕</button>`;
+        row.querySelector('button').onclick = () => { if (host.children.length > 1) row.remove(); };
+        host.append(row);
+    };
+    (r.dirs.length ? r.dirs : [{ path: '', exists: null }]).forEach(addRow);
+    $('#sd-add').onclick = () => addRow();
+}
 function layout() {
     $('#app').innerHTML = `<div class="layout"><aside><div class="head"><span id="brand" class="brand-mark" style="cursor:pointer" title="Go to Home dashboard">${LOGO_SVG}<span>Fandejo</span></span><span>
       <button class="ghost" id="theme" title="Toggle Dark / Light theme">◐</button><button class="ghost" id="out" title="Sign out">⏻</button></span></div>
       <input class="search" id="flt" placeholder="Filter…" value="${esc(S.filter)}"><div class="tree" id="tree"></div>
-      ${S.driver === 'mysql' ? '<div style="padding:10px"><button id="newdb" style="width:100%">+ New database</button></div>' : ''}</aside>
+      <div style="padding:10px"><button id="newdb" style="width:100%">+ New database</button></div></aside>
       <main><div class="top"><div class="crumbs" id="crumbs"></div><button id="ghome">⌂ Home</button>${S.driver === 'mysql' ? '<button id="gusers">Users</button>' : ''}<button id="gsql">SQL</button></div><div id="tabs" class="tabs"></div><div class="content" id="content"></div></main></div>`;
     $('#theme').onclick = () => { const r = document.documentElement; r.dataset.theme = r.dataset.theme === 'light' ? '' : 'light'; localStorage.theme = r.dataset.theme; };
     $('#out').onclick = async () => { await api('logout'); location.reload(); };
     $('#flt').oninput = e => { S.filter = e.target.value; tree(); $('#flt').focus(); };
-    if ($('#newdb')) $('#newdb').onclick = () => modal(`<h3>New database</h3><label>Name<input name="name" required autofocus></label><label>Default Collation<select name="collation">${collSelectOpts(getPrefs().collation)}</select></label>`, async v => { await api('create_db', v); await loadDbs(); S.db = v.name; S.table = null; S.tab = 'tables'; await loadTables(v.name); layout(); toast('Database created'); });
+    $('#newdb').onclick = promptNewDb;
     const goHome = () => { S.db = null; S.table = null; S.tab = 'home'; render(); };
     $('#brand').onclick = goHome;
     $('#ghome').onclick = goHome;
@@ -109,12 +172,12 @@ function layout() {
 }
 function tree() {
     const f = S.filter.toLowerCase(), el = $('#tree'); if (!el) return;
-    el.innerHTML = S.dbs.filter(d => S.driver === 'sqlite' || !f || d.name.toLowerCase().includes(f) || (S.tables[d.name] || []).some(t => t.name.toLowerCase().includes(f))).map(d => {
-        const open = S.driver === 'sqlite' || S.db === d.name;
-        let h = S.driver === 'sqlite' ? `<div class="node db ${S.db === 'main' && !S.table ? 'active' : ''}" data-db="main"><span>▾ 🗄 main (SQLite)</span><small>${(S.tables.main || []).length}</small></div>` : `<div class="node db ${open && !S.table ? 'active' : ''}" data-db="${esc(d.name)}"><span>${open ? '▾' : '▸'} 🗄 ${esc(d.name)}</span><small>${d.tables ?? ''}</small></div>`;
+    el.innerHTML = S.dbs.filter(d => !f || d.name.toLowerCase().includes(f) || (S.tables[d.name] || []).some(t => t.name.toLowerCase().includes(f))).map(d => {
+        const open = S.db === d.name;
+        let h = `<div class="node db ${open && !S.table ? 'active' : ''}" data-db="${esc(d.name)}"><span>${open ? '▾' : '▸'} 🗄 ${esc(d.label || d.name)}</span><small>${d.tables ?? ''}</small></div>`;
         if (open) h += (S.tables[d.name] || []).filter(t => !f || t.name.toLowerCase().includes(f)).map(t => `<div class="node tb ${S.table === t.name ? 'active' : ''}" data-db="${esc(d.name)}" data-tb="${esc(t.name)}"><span>${t.type?.includes('VIEW') || t.type === 'view' ? '👁' : '▦'} ${esc(t.name)}</span><small>${t.rows ?? ''}</small></div>`).join('');
         return h;
-    }).join('') || '<div class="empty">Nothing found</div>';
+    }).join('') || `<div class="empty">${S.driver === 'sqlite' ? 'No SQLite files in sandbox yet' : 'Nothing found'}</div>`;
     el.querySelectorAll('.node').forEach(n => n.onclick = guard(async () => {
         S.db = n.dataset.db; S.table = n.dataset.tb || null; S.tab = S.table ? 'browse' : 'tables';
         S.browse = { ...S.browse, page: 1, per: getPrefs().perPage, sort: '', search: '' };
@@ -124,11 +187,11 @@ function tree() {
 }
 function render() {
     tree();
-    $('#crumbs').innerHTML = S.db ? `<a href="#" id="chome" class="crumb">Fandejo</a> / <a href="#" id="cdb" class="crumb">${S.driver === 'sqlite' ? 'Tables' : esc(S.db)}</a>${S.table ? ' / <b>' + esc(S.table) + '</b>' : ''}` : '<b>Fandejo</b> <span style="color:var(--mute)">/ Foundry Dashboard</span>';
+    $('#crumbs').innerHTML = S.db ? `<a href="#" id="chome" class="crumb">Fandejo</a> / <a href="#" id="cdb" class="crumb">${esc(S.db)}</a>${S.table ? ' / <b>' + esc(S.table) + '</b>' : ''}` : '<b>Fandejo</b> <span style="color:var(--mute)">/ Foundry Dashboard</span>';
     if ($('#chome')) $('#chome').onclick = e => { e.preventDefault(); S.db = null; S.table = null; S.tab = 'home'; render(); };
     if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
-        : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ...(S.driver === 'mysql' ? [['dropdb', 'Operations']] : [])]
+        : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
             : [['home', 'Dashboard'], ...(S.driver === 'mysql' ? [['users', 'Users']] : []), ['sql', 'SQL']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
@@ -222,7 +285,7 @@ function renderFieldInput(name, pt, val, isInsert = false, extra = '', hasDef = 
         inputHtml = `<input name="v_${esc(name)}" value="${esc(vStr)}" style="flex:1">`;
     }
     const toggleBox = isInsert
-        ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(name)}" ${/auto_increment/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
+        ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(name)}" ${/auto_?increment|rowid auto/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
         : `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="n_${esc(name)}" ${isNull ? 'checked' : ''}>NULL</label>`;
     return `<label>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}</small><div class="row" style="position:relative">${inputHtml}${toggleBox}</div></label>`;
 }
@@ -346,28 +409,37 @@ function wireFieldInputs(root) {
 }
 
 const TYPE_GROUPS = [
-    ['Integer', ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT']], ['Decimal', ['DECIMAL', 'FLOAT', 'DOUBLE']],
+    ['Integer', ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT']], ['Decimal', ['DECIMAL', 'FLOAT', 'DOUBLE', 'REAL', 'NUMERIC']],
     ['Text', ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET', 'JSON']],
     ['Date & time', ['DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'YEAR']], ['Binary', ['BINARY', 'VARBINARY', 'TINYBLOB', 'BLOB', 'MEDIUMBLOB', 'LONGBLOB', 'BIT', 'BOOLEAN']],
 ];
-const T_INT = ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT'], T_NUM = [...T_INT, 'DECIMAL', 'FLOAT', 'DOUBLE'], T_TEXT = ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET'];
+const SQLITE_UNSUPPORTED_TYPES = ['ENUM', 'SET', 'YEAR', 'BIT', 'MEDIUMINT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT', 'TINYBLOB', 'MEDIUMBLOB', 'LONGBLOB'];
+const typeGroupsForDriver = () => S.driver === 'sqlite'
+    ? TYPE_GROUPS.map(([g, l]) => [g, l.filter(t => !SQLITE_UNSUPPORTED_TYPES.includes(t))])
+    : TYPE_GROUPS;
+const T_INT = ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT'], T_NUM = [...T_INT, 'DECIMAL', 'FLOAT', 'DOUBLE', 'REAL', 'NUMERIC'], T_TEXT = ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET'];
 const T_LEN = ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT', 'DECIMAL', 'FLOAT', 'DOUBLE', 'CHAR', 'VARCHAR', 'BINARY', 'VARBINARY', 'BIT', 'DATETIME', 'TIMESTAMP', 'TIME'];
 const COLLATIONS = ['utf8mb4_unicode_ci', 'utf8mb4_general_ci', 'utf8mb4_bin', 'utf8mb4_0900_ai_ci', 'utf8mb3_general_ci', 'latin1_swedish_ci', 'latin1_general_ci'];
 
 async function structure() {
     const [r, ix, fk] = await Promise.all([api('structure', { db: S.db, table: S.table }), api('indexes', { db: S.db, table: S.table }), api('foreign_keys', { db: S.db, table: S.table })]);
     const my = S.driver === 'mysql';
-    C().innerHTML = `<div class="bar"><button class="primary" id="ac">+ Add column</button></div><div class="tw"><table><tr><th>#</th><th>Name</th><th>Type</th><th>Null</th><th>Key</th><th>Default</th><th>Extra</th>${my ? '<th>Comment</th>' : ''}<th></th></tr>${r.columns.map((c, i) => `<tr><td>${i + 1}</td><td><b>${c.key === 'PRI' ? '<span class="pk">🔑</span> ' : ''}${esc(c.name)}</b></td><td>${esc(c.type)}</td><td>${c.null ? 'YES' : 'NO'}</td><td>${esc(c.key)}</td><td>${c.def.mode === 'null' ? '<i>NULL</i>' : c.def.mode === 'none' ? '<i style="color:var(--mute)">none</i>' : esc(c.def.value)}</td><td>${esc(c.extra)}</td>${my ? `<td>${esc(c.comment)}</td>` : ''}<td class="act"><button class="ghost" data-ec="${i}">Edit</button><button class="danger ghost" data-dc="${esc(c.name)}">Drop</button></td></tr>`).join('')}</table></div>
+    const isSingleCol = r.columns.length <= 1;
+    C().innerHTML = `<div class="bar"><button class="primary" id="ac">+ Add column</button></div><div class="tw"><table><tr><th>#</th><th>Name</th><th>Type</th><th>Null</th><th>Key</th><th>Default</th><th>Extra</th>${my ? '<th>Comment</th>' : ''}<th></th></tr>${r.columns.map((c, i) => {
+        const cantDropSqlite = !my && (c.key === 'PRI' || isSingleCol);
+        const dropTitle = !my && c.key === 'PRI' ? 'SQLite cannot drop a PRIMARY KEY column without rebuilding the table' : (isSingleCol ? 'Cannot drop the only column in a table' : '');
+        return `<tr><td>${i + 1}</td><td><b>${c.key === 'PRI' ? '<span class="pk">🔑</span> ' : ''}${esc(c.name)}</b></td><td>${esc(c.type)}</td><td>${c.null ? 'YES' : 'NO'}</td><td>${esc(c.key)}</td><td>${c.def.mode === 'null' ? '<i>NULL</i>' : c.def.mode === 'none' ? '<i style="color:var(--mute)">none</i>' : esc(c.def.value)}</td><td>${esc(c.extra)}</td>${my ? `<td>${esc(c.comment)}</td>` : ''}<td class="act"><button class="ghost" data-ec="${i}">${my ? 'Edit' : 'Rename'}</button><button class="danger ghost" data-dc="${esc(c.name)}" ${cantDropSqlite ? `disabled title="${esc(dropTitle)}"` : ''}>Drop</button></td></tr>`;
+    }).join('')}</table></div>
     <div class="bar" style="margin-top:22px"><h3 style="margin:0">Indexes</h3><span class="spacer"></span><button id="ai">+ Add index</button></div>
     ${ix.indexes.length ? `<div class="tw"><table><tr><th>Name</th><th>Type</th><th>Columns</th><th>Method</th><th>Cardinality</th><th></th></tr>${ix.indexes.map((i, n) => `<tr><td><b>${esc(i.name)}</b></td><td><span class="lvl lvl-${i.type === 'PRIMARY' ? 'global' : i.type === 'UNIQUE' ? 'table' : 'database'}">${i.type}</span></td><td>${i.columns.map(c => `<span class="chip">${esc(c.name)}${c.length ? `(${esc(c.length)})` : ''}${c.desc ? ' ↓' : ''}</span>`).join(' ')}</td><td>${esc(i.method)}</td><td>${esc(i.cardinality ?? '–')}</td><td class="act">${i.droppable ? `<button class="danger ghost" data-di="${n}">Drop</button>` : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No indexes</div>'}
-    <div class="bar" style="margin-top:22px"><h3 style="margin:0">Foreign keys</h3><span class="spacer"></span><button id="af" ${fk.supported ? '' : 'disabled title="SQLite cannot add foreign keys to an existing table"'}>+ Add foreign key</button></div>
+    <div class="bar" style="margin-top:22px"><h3 style="margin:0">Foreign keys</h3><span class="spacer"></span><button id="af" ${fk.supported ? '' : 'disabled title="SQLite foreign keys can only be defined at CREATE TABLE time"'}>+ Add foreign key</button></div>
     ${fk.foreign_keys.length ? `<div class="tw"><table><tr><th>Name</th><th>Columns</th><th>References</th><th>On delete</th><th>On update</th><th></th></tr>${fk.foreign_keys.map((f, n) => `<tr><td><b>${esc(f.name)}</b></td><td>${f.pairs.map(x => `<span class="chip">${esc(x.col)}</span>`).join(' ')}</td><td>${esc((f.ref_db && f.ref_db !== S.db ? f.ref_db + '.' : '') + f.ref_table)} (${f.pairs.map(x => esc(x.ref)).join(', ')})</td><td>${esc(f.on_delete)}</td><td>${esc(f.on_update)}</td><td class="act">${f.droppable ? `<button class="danger ghost" data-df="${n}">Drop</button>` : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No foreign keys</div>'}
     <h3>CREATE statement</h3><pre>${esc(r.create)}</pre>`;
-    C().querySelectorAll('[data-dc]').forEach(b => b.onclick = () => confirmDo(`Drop column ${b.dataset.dc}? Its data will be lost.`, async () => { await api('drop_column', { db: S.db, table: S.table, column: b.dataset.dc }); render(); }));
+    C().querySelectorAll('[data-dc]:not([disabled])').forEach(b => b.onclick = () => confirmDo(`Drop column ${b.dataset.dc}? Its data will be lost.`, async () => { await api('drop_column', { db: S.db, table: S.table, column: b.dataset.dc }); render(); }));
     C().querySelectorAll('[data-ec]').forEach(b => b.onclick = () => columnEditor(r.columns, r.columns[b.dataset.ec]));
     $('#ac').onclick = () => columnEditor(r.columns, null);
     $('#ai').onclick = () => indexEditor(r.columns);
-    $('#af').onclick = () => fkEditor(r.columns);
+    if (fk.supported) $('#af').onclick = () => fkEditor(r.columns);
     C().querySelectorAll('[data-di]').forEach(b => b.onclick = () => { const i = ix.indexes[b.dataset.di]; confirmDo(`Drop ${i.type === 'PRIMARY' ? 'the primary key' : 'index ' + i.name}?`, async () => { await api('drop_index', { db: S.db, table: S.table, name: i.name }); toast('Index dropped'); render(); }); });
     C().querySelectorAll('[data-df]').forEach(b => b.onclick = () => { const f = fk.foreign_keys[b.dataset.df]; confirmDo(`Drop foreign key ${f.name}?`, async () => { await api('drop_fk', { db: S.db, table: S.table, name: f.name }); toast('Foreign key dropped'); render(); }); });
 }
@@ -418,12 +490,14 @@ async function fkEditor(cols) {
 
 function columnEditor(cols, col) {
     const my = S.driver === 'mysql', adding = !col;
-    const c = col || { name: '', parsed: { base: 'VARCHAR', length: '255', values: [], unsigned: false }, null: false, def: { mode: 'none', value: '' }, ai: false, on_update: false, collation: '', comment: '' };
+    const c = col || { name: '', parsed: { base: 'VARCHAR', length: '255', values: [], unsigned: false }, null: !my, def: { mode: 'none', value: '' }, ai: false, on_update: false, collation: '', comment: '' };
     const pt = c.parsed, others = cols.filter(x => x.name !== c.name);
-    const typeOpts = TYPE_GROUPS.map(([g, l]) => `<optgroup label="${g}">${l.map(t => `<option ${t === pt.base ? 'selected' : ''}>${t}</option>`).join('')}</optgroup>`).join('');
+    const groups = typeGroupsForDriver();
+    const typeOpts = groups.map(([g, l]) => `<optgroup label="${g}">${l.map(t => `<option ${t === pt.base ? 'selected' : ''}>${t}</option>`).join('')}</optgroup>`).join('');
     const lite = !my && !adding; // SQLite can only rename existing columns
-    const html = `<div style="width:min(660px,80vw)"><h3>${adding ? 'Add column' : 'Edit column <span style="color:var(--mute)">' + esc(c.name) + '</span>'}</h3>
-      ${lite ? '<div class="msg">SQLite can only rename existing columns. For other changes use the SQL editor.</div>' : ''}
+    const html = `<div style="width:min(660px,80vw)"><h3>${adding ? 'Add column' : (my ? 'Edit column ' : 'Rename column ') + '<span style="color:var(--mute)">' + esc(c.name) + '</span>'}</h3>
+      ${lite ? '<div class="msg">SQLite only supports renaming existing columns in place (<code>ALTER TABLE … RENAME COLUMN</code>). Type, nullability, and default changes require a table rebuild in the SQL editor.</div>' : ''}
+      ${!my && adding ? '<div class="msg">In SQLite, adding a <code>NOT NULL</code> column to an existing table requires a non-NULL default value.</div>' : ''}
       <div class="ce-grid">
         <label>Name<input name="name" value="${esc(c.name)}" required autofocus></label>
         <label>Type<select name="type" ${lite ? 'disabled' : ''}>${typeOpts}</select></label>
@@ -450,7 +524,7 @@ function columnEditor(cols, col) {
         ${my ? `<label class="pc" id="l-uns"><input type="checkbox" name="unsigned" ${pt.unsigned ? 'checked' : ''}><span>Unsigned</span><small>No negative numbers</small></label>
         <label class="pc" id="l-ai"><input type="checkbox" name="ai" ${c.ai ? 'checked' : ''}><span>Auto increment</span><small>Needs a key on the column</small></label>
         <label class="pc" id="l-ou"><input type="checkbox" name="on_update" ${c.on_update ? 'checked' : ''}><span>On update NOW()</span><small>Auto-update timestamp on row edit</small></label>` : ''}</div>
-      ${!adding ? '<div class="msg">Changing a type may truncate or convert existing data.</div>' : ''}
+      ${!adding && my ? '<div class="msg">Changing a type may truncate or convert existing data.</div>' : ''}
       <div class="sqlprev"><small>SQL preview</small><pre id="prev">…</pre></div></div>`;
     modal(html, async () => { const r = await api(adding ? 'add_column' : 'alter_column', body()); toast(adding ? 'Column added' : 'Column updated'); render(); });
     const form = $('#modal form'), f = n => form.elements[n];
@@ -465,7 +539,7 @@ function columnEditor(cols, col) {
     const sync = () => {
         const t = f('type').value, isDT = ['DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'YEAR'].includes(t);
         $('#l-len').hidden = !T_LEN.includes(t); $('#l-vals').hidden = !['ENUM', 'SET'].includes(t);
-        $('#dt-presets').hidden = !isDT;
+        $('#dt-presets').hidden = !isDT || lite;
         if (my) {
             $('#l-coll').hidden = !T_TEXT.includes(t);
             $('#l-uns').hidden = !T_NUM.includes(t);
@@ -490,7 +564,8 @@ function columnEditor(cols, col) {
     form.querySelectorAll('[data-dp]').forEach(b => b.onclick = () => {
         const dp = b.dataset.dp, tp = f('type').value;
         if (dp === 'now' || dp === 'upd') {
-            if (!['DATETIME', 'TIMESTAMP'].includes(tp) && tp === 'DATE') { f('default_mode').value = 'expr'; f('default').value = 'CURDATE()'; }
+            if (!['DATETIME', 'TIMESTAMP'].includes(tp) && tp === 'DATE') { f('default_mode').value = 'expr'; f('default').value = my ? 'CURDATE()' : 'CURRENT_DATE'; }
+            else if (tp === 'TIME') { f('default_mode').value = 'expr'; f('default').value = my ? 'CURTIME()' : 'CURRENT_TIME'; }
             else { f('default_mode').value = 'expr'; f('default').value = 'CURRENT_TIMESTAMP'; }
             if (my && f('on_update')) f('on_update').checked = (dp === 'upd');
         } else if (dp === 'today') {
@@ -620,6 +695,10 @@ async function sqlView() {
     };
 
     const runSql = guard(async customSql => {
+        if (S.driver === 'sqlite' && !S.db) {
+            if (S.dbs.length) S.db = S.dbs[0].name;
+            else return toast('Create or select an SQLite database first', true);
+        }
         S.sql = ed.value;
         const sel = ed.value.slice(ed.selectionStart, ed.selectionEnd).trim();
         const toRun = typeof customSql === 'string' ? customSql : (sel || S.sql);
@@ -720,12 +799,15 @@ async function ops() {
     }
 }
 
-const TYPES = ['INT', 'BIGINT', 'VARCHAR', 'CHAR', 'TEXT', 'LONGTEXT', 'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR', 'DECIMAL', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'BLOB', 'JSON', 'TINYINT'];
+const TYPES_MYSQL = ['INT', 'BIGINT', 'TINYINT', 'VARCHAR', 'CHAR', 'TEXT', 'LONGTEXT', 'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR', 'DECIMAL', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'BLOB', 'JSON'];
+const TYPES_SQLITE = ['INTEGER', 'INT', 'BIGINT', 'TEXT', 'VARCHAR', 'REAL', 'NUMERIC', 'DECIMAL', 'BOOLEAN', 'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'BLOB', 'JSON'];
 async function newTable() {
     const my = S.driver === 'mysql', prefs = getPrefs();
+    const types = my ? TYPES_MYSQL : TYPES_SQLITE;
     const dbColl = S.dbs.find(d => d.name === S.db)?.collation || prefs.collation;
-    const rowH = (i, d = {}) => `<tr><td><input name="name" value="${d.name || ''}" placeholder="column"></td><td><select name="type">${TYPES.map(t => `<option ${t === (d.type || 'INT') ? 'selected' : ''}>${t}</option>`).join('')}</select></td><td><input name="length" size="6" value="${d.length || ''}"></td><td><input name="default" size="14" value="${d.def || ''}" list="def-presets" placeholder="literal or CURRENT_TIMESTAMP"></td><td><input type="checkbox" name="null" ${d.null ? 'checked' : ''}></td><td><input type="checkbox" name="pk" ${d.pk ? 'checked' : ''}></td><td><input type="checkbox" name="ai" ${d.ai ? 'checked' : ''}></td>${my ? `<td><input type="checkbox" name="on_update" ${d.ou ? 'checked' : ''} title="ON UPDATE CURRENT_TIMESTAMP (for DATETIME/TIMESTAMP)"></td>` : ''}<td><button type="button" class="ghost danger" onclick="this.closest('tr').remove()">✕</button></td></tr>`;
-    C().innerHTML = `<datalist id="def-presets"><option value="CURRENT_TIMESTAMP"><option value="NULL"><option value="0"></datalist>
+    const defInt = my ? 'INT' : 'INTEGER';
+    const rowH = (i, d = {}) => `<tr><td><input name="name" value="${d.name || ''}" placeholder="column"></td><td><select name="type">${types.map(t => `<option ${t === (d.type || defInt) ? 'selected' : ''}>${t}</option>`).join('')}</select></td><td><input name="length" size="6" value="${d.length || ''}"></td><td><input name="default" size="14" value="${d.def || ''}" list="def-presets" placeholder="literal or CURRENT_TIMESTAMP"></td><td><input type="checkbox" name="null" ${d.null ? 'checked' : ''}></td><td><input type="checkbox" name="pk" ${d.pk ? 'checked' : ''}></td><td><input type="checkbox" name="ai" ${d.ai ? 'checked' : ''}></td>${my ? `<td><input type="checkbox" name="on_update" ${d.ou ? 'checked' : ''} title="ON UPDATE CURRENT_TIMESTAMP (for DATETIME/TIMESTAMP)"></td>` : ''}<td><button type="button" class="ghost danger" onclick="this.closest('tr').remove()">✕</button></td></tr>`;
+    C().innerHTML = `<datalist id="def-presets"><option value="CURRENT_TIMESTAMP"><option value="CURRENT_DATE"><option value="CURRENT_TIME"><option value="NULL"><option value="0"></datalist>
       <div class="bar">
         <input id="tn" placeholder="Table name" style="width:200px">
         ${my ? `<label class="row" style="font-size:12px;color:var(--mute)">Engine <select id="nt-eng">${engineSelectOpts(prefs.engine)}</select></label>
@@ -735,10 +817,26 @@ async function newTable() {
         <button id="ats" title="Add created_at and updated_at timestamp columns">+ Timestamps</button>
         <button id="ct" class="primary">Create</button>
       </div>
+      ${!my ? '<div class="msg" style="margin-bottom:10px;font-size:12px">SQLite tip: <b>Auto-Increment (AI)</b> is only supported on a single <code>INTEGER</code> primary key column.</div>' : ''}
       <div class="tw"><table id="ct_t"><tr><th>Name</th><th>Type</th><th>Length</th><th>Default</th><th>Null</th><th>PK</th><th>AI</th>${my ? '<th title="ON UPDATE CURRENT_TIMESTAMP">On Upd</th>' : ''}<th></th></tr>${rowH(0, { name: 'id', pk: true, ai: true })}</table></div>`;
-    $('#ar').onclick = () => $('#ct_t').insertAdjacentHTML('beforeend', rowH());
+    const syncSqliteAi = () => {
+        if (my) return;
+        const trs = [...$('#ct_t').querySelectorAll('tr')].slice(1);
+        const pkCount = trs.filter(tr => tr.querySelector('[name=pk]').checked).length;
+        trs.forEach(tr => {
+            const tp = tr.querySelector('[name=type]').value;
+            const pk = tr.querySelector('[name=pk]').checked;
+            const ai = tr.querySelector('[name=ai]');
+            const canAi = pk && pkCount === 1 && ['INTEGER', 'INT', 'BIGINT', 'TINYINT', 'SMALLINT'].includes(tp);
+            ai.disabled = !canAi;
+            if (!canAi) ai.checked = false;
+        });
+    };
+    $('#ct_t').addEventListener('change', syncSqliteAi);
+    $('#ar').onclick = () => { $('#ct_t').insertAdjacentHTML('beforeend', rowH()); syncSqliteAi(); };
     $('#ats').onclick = () => {
         $('#ct_t').insertAdjacentHTML('beforeend', rowH(0, { name: 'created_at', type: 'DATETIME', def: 'CURRENT_TIMESTAMP' }) + rowH(0, { name: 'updated_at', type: 'DATETIME', def: 'CURRENT_TIMESTAMP', ou: true }));
+        syncSqliteAi();
     };
     $('#ct').onclick = guard(async () => {
         const columns = [...$('#ct_t').querySelectorAll('tr')].slice(1).map(tr => {
@@ -854,7 +952,7 @@ function csvWizard(text, fname, tbls) {
         <div class="tw" style="margin-top:8px"><table><tr><th>CSV column</th><th>Sample</th><th>${isNew ? 'New column name' : 'Import into'}</th>${isNew ? '<th>Type</th><th>Length</th>' : ''}</tr>
         ${names.map((n, i) => `<tr><td><b>${esc(n)}</b></td><td style="color:var(--mute)" title="${esc(sample.map(r => r[i]).join(' | '))}">${esc(sample.map(r => r[i]).join(' · '))}</td>
           <td>${isNew ? `<input data-m="${i}" value="${esc(st.map[i])}">` : `<select data-m="${i}"><option value="">— skip —</option>${st.tcols.map(c => `<option ${c.name === st.map[i] ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`}</td>
-          ${isNew ? `<td><select data-ty="${i}">${TYPE_GROUPS.flatMap(g => g[1]).filter(t => !['ENUM', 'SET', 'BIT'].includes(t)).map(t => `<option ${t === st.types[i][0] ? 'selected' : ''}>${t}</option>`).join('')}</select></td><td><input data-ln="${i}" size="5" value="${esc(st.types[i][1])}"></td>` : ''}</tr>`).join('')}</table></div>
+          ${isNew ? `<td><select data-ty="${i}">${typeGroupsForDriver().flatMap(g => g[1]).filter(t => !['ENUM', 'SET', 'BIT'].includes(t)).map(t => `<option ${t === st.types[i][0] ? 'selected' : ''}>${t}</option>`).join('')}</select></td><td><input data-ln="${i}" size="5" value="${esc(st.types[i][1])}"></td>` : ''}</tr>`).join('')}</table></div>
         <div class="bar" style="margin-top:12px"><button class="primary" id="c-go">Import ${body().length} rows</button><progress id="c-p" max="100" value="0" hidden style="flex:1"></progress></div><div id="c-r"></div>`;
         $('#c-d').onchange = e => { st.delim = e.target.value === 'tab' ? '\t' : e.target.value; reparse(); };
         $('#c-t').onchange = e => { st.target = e.target.value; retarget(); };
@@ -895,7 +993,26 @@ function csvWizard(text, fname, tbls) {
 }
 
 async function dropdb() {
+    const my = S.driver === 'mysql';
     const dbObj = S.dbs.find(d => d.name === S.db) || {};
+    if (!my) {
+        C().innerHTML = `<div class="dash-grid" style="max-width:960px">
+          <div class="dash-card">
+            <h3>🗄 SQLite Database File</h3>
+            <div class="kv"><span>Database Name</span><b>${esc(dbObj.label || S.db)}</b></div>
+            <div class="kv"><span>Sandbox Path</span><b><code style="font-size:12px;word-break:break-all">${esc(dbObj.path || S.db)}</code></b></div>
+            <div class="kv"><span>File Size</span><b>${fmtSize(dbObj.size)}</b></div>
+            <div class="kv"><span>Tables & Views</span><b>${dbObj.tables ?? (S.tables[S.db] || []).length}</b></div>
+          </div>
+          <div class="dash-card">
+            <h3>⚠ Danger Zone</h3>
+            <p style="color:var(--mute);font-size:12px">Permanently delete SQLite database file <b>${esc(S.db)}</b> (including its <code>-wal</code> and <code>-shm</code> files) from the sandbox directory.</p>
+            <button class="danger" id="dd">Delete SQLite file ${esc(S.db)}</button>
+          </div>
+        </div>`;
+        $('#dd').onclick = () => confirmDo(`Permanently delete SQLite database file ${S.db}?`, async () => { await api('drop_db', { db: S.db }); S.db = null; await loadDbs(); layout(); toast('SQLite database deleted'); });
+        return;
+    }
     const curColl = dbObj.collation || getPrefs().collation;
     const tblCount = (S.tables[S.db] || []).filter(t => t.type !== 'VIEW').length;
     C().innerHTML = `<div class="dash-grid" style="max-width:960px">
@@ -1057,8 +1174,8 @@ function fmtUptime(sec) {
 async function dbsHome() {
     const info = await api('server_info');
     const my = S.driver === 'mysql';
-    const totalTables = my ? S.dbs.reduce((a, d) => a + (+d.tables || 0), 0) : (S.tables.main || []).length;
-    const totalSize = my ? S.dbs.reduce((a, d) => a + (+d.size || 0), 0) : info.file_size;
+    const totalTables = S.dbs.reduce((a, d) => a + (+d.tables || 0), 0);
+    const totalSize = S.dbs.reduce((a, d) => a + (+d.size || 0), 0) || info.file_size || 0;
 
     const DOCS = {
         quickstart: [`🔥 Fandejo Quickstart Guide`, `<p>Welcome to <b>Fandejo</b> (<i>fahn-DAY-oh</i>, Esperanto for "foundry") — a fast, modern web workbench for MariaDB, MySQL, and SQLite3 built for PHP 8.5+ with zero external framework overhead.</p>
@@ -1098,7 +1215,7 @@ async function dbsHome() {
           <p style="color:var(--mute);margin:4px 0 0">Cast, inspect, and query your databases in one workspace.</p>
         </div>
         <div class="dash-kpis">
-          <div class="kpi"><span>${S.dbs.length}</span><small>${my ? 'Databases' : 'Database'}</small></div>
+          <div class="kpi"><span>${S.dbs.length}</span><small>Databases</small></div>
           <div class="kpi"><span>${totalTables}</span><small>Tables</small></div>
           <div class="kpi"><span>${fmtSize(totalSize)}</span><small>Total Size</small></div>
           ${my ? `<div class="kpi"><span>${fmtUptime(info.uptime)}</span><small>Uptime</small></div>` : ''}
@@ -1110,13 +1227,14 @@ async function dbsHome() {
           <h3>🗄 Database Server</h3>
           <div class="kv"><span>Engine</span><b>${esc(info.server_name)} ${esc(info.server_version)}</b></div>
           ${info.version_comment ? `<div class="kv"><span>Distribution</span><b>${esc(info.version_comment)}</b></div>` : ''}
-          <div class="kv"><span>${my ? 'Host & Port' : 'Database File'}</span><b>${esc(info.host)}</b></div>
+          <div class="kv"><span>${my ? 'Host & Port' : 'Sandbox Directories'}</span><b><code style="font-size:12px;word-break:break-all">${esc(info.host)}</code></b></div>
           <div class="kv"><span>Server Charset</span><b>${esc(info.charset)}</b></div>
           ${my ? `<div class="kv"><span>Active Threads / Max</span><b>${info.threads} / ${info.max_connections}</b></div>
           <div class="kv"><span>Total Queries / Slow</span><b>${Number(info.questions).toLocaleString()} (${info.slow_queries} slow)</b></div>
           ${info.socket ? `<div class="kv"><span>Socket</span><b>${esc(info.socket)}</b></div>` : ''}`
           : `<div class="kv"><span>Journal Mode</span><b>${esc(info.journal_mode)}</b></div>
-          <div class="kv"><span>Foreign Keys</span><b>${info.foreign_keys_on ? 'Enabled' : 'Disabled'}</b></div>`}
+          <div class="kv"><span>Foreign Keys</span><b>${info.foreign_keys_on ? 'Enabled' : 'Disabled'}</b></div>
+          <div class="bar" style="margin-top:12px;margin-bottom:0"><button id="d-dirs">📁 Manage Sandbox Directories…</button></div>`}
         </div>
 
         <div class="dash-card">
@@ -1128,7 +1246,7 @@ async function dbsHome() {
               <small style="color:var(--mute)">Connected as ${esc(info.user)}</small>
             </div>
           </div>
-          <div class="kv"><span>Authentication</span><b>Libsodium Split-Key + CSRF</b></div>
+          <div class="kv"><span>Authentication</span><b>${my ? 'Libsodium Split-Key + CSRF' : 'Config Argon2id + Split-Key + CSRF'}</b></div>
           <div class="kv"><span>Theme</span><b>${document.documentElement.dataset.theme === 'light' ? 'Light mode' : 'Dark mode'} <a href="#" id="d-th" class="crumb" style="margin-left:6px">Switch</a></b></div>
           <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
             <small style="color:var(--mute);font-weight:600">Default Preferences (saved in browser)</small>
@@ -1139,7 +1257,8 @@ async function dbsHome() {
             </div>
           </div>
           <div class="bar" style="margin-top:14px;margin-bottom:0">
-            ${my ? `<button id="d-pw">🔑 Change password</button><button id="d-gr">🛡 My privileges</button>` : ''}
+            <button id="d-pw">🔑 Change password</button>
+            ${my ? `<button id="d-gr">🛡 My privileges</button>` : ''}
             <button id="d-out" class="danger">⏻ Sign out</button>
           </div>
         </div>
@@ -1177,19 +1296,23 @@ async function dbsHome() {
         <div class="bar" style="margin-bottom:10px">
           <h3 style="margin:0">🗄 Databases Overview</h3>
           <span class="spacer"></span>
-          ${my ? `<button class="primary" id="d-newdb">+ New database</button>` : ''}
+          ${!my ? `<button id="d-dirs2">📁 Sandbox Directories</button>` : ''}
+          <button class="primary" id="d-newdb">+ New database</button>
           <button id="d-sql">▶ Open SQL Console</button>
         </div>
-        <div class="db-cards">
-          ${S.dbs.map(d => `<div class="db-card" data-db="${esc(d.name)}">
-            <div style="font-weight:700">🗄 ${esc(d.name)}</div>
-            <small style="color:var(--mute)">${my ? `${d.tables ?? 0} tables · ${fmtSize(d.size)}` : `${totalTables} tables · ${fmtSize(totalSize)}`}</small>
+        ${S.dbs.length ? `<div class="db-cards">
+          ${S.dbs.map(d => `<div class="db-card" data-db="${esc(d.name)}" title="${esc(d.path || d.name)}">
+            <div style="font-weight:700">🗄 ${esc(d.label || d.name)}</div>
+            <small style="color:var(--mute)">${d.tables ?? 0} tables · ${fmtSize(d.size)}</small>
+            ${!my && S.sqliteDirs?.length > 1 && d.dir ? `<small style="display:block;color:var(--mute);font-size:11px;opacity:.75;overflow:hidden;text-overflow:ellipsis">${esc(d.dir)}</small>` : ''}
           </div>`).join('')}
-        </div>
+        </div>` : `<div class="empty">No SQLite databases in sandbox directory yet — click <b>+ New database</b> or <b>📁 Sandbox Directories</b> to add an existing project folder.</div>`}
       </div>
     </div>`;
 
     $('#d-th').onclick = e => { e.preventDefault(); $('#theme').click(); dbsHome(); };
+    if ($('#d-dirs')) $('#d-dirs').onclick = guard(manageSqliteDirs);
+    if ($('#d-dirs2')) $('#d-dirs2').onclick = guard(manageSqliteDirs);
     if ($('#p-eng')) $('#p-eng').onchange = e => { savePrefs({ engine: e.target.value }); toast('Default engine saved'); };
     if ($('#p-coll')) $('#p-coll').onchange = e => { savePrefs({ collation: e.target.value }); toast('Default collation saved'); };
     if ($('#p-per')) $('#p-per').onchange = e => { savePrefs({ perPage: +e.target.value }); toast('Default page size saved'); };

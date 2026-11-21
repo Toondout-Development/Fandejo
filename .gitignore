@@ -1,3 +1,8 @@
+# Local configuration & SQLite data directory
+/config.php
+/data/
+/HANDOFF.md
+
 # Local SQLite database files
 *.sqlite
 *.sqlite3

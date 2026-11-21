@@ -31,5 +31,8 @@ Open http://localhost:8090 and sign in to your MariaDB/MySQL server or open an S
 
 ## Security Architecture
 - **Libsodium Split-Key Session Encryption:** Database passwords are encrypted with `XSalsa20-Poly1305` (`sodium_crypto_secretbox`). The server session file stores only ciphertext, while the random 256-bit key lives only in an `HttpOnly`, `SameSite=Strict` browser cookie.
+- **SQLite3 Authentication Gate & Directory Sandbox (`config.php`):**
+  - SQLite mode requires an authenticated username and Argon2id password hash stored in `config.php` (copy from [config.example.php](file:///media/brian/LinuxData/Projects/Fandejo/config.example.php) or initialize automatically on first SQLite login).
+  - SQLite access is strictly sandboxed to the configured `sqlite_dirs` catalog directories (defaulting to `./data`). Arbitrary filesystem paths, symlinks, and `../` traversal are blocked, and every `.sqlite` / `.sqlite3` / `.db` file in the sandbox appears as a first-class database in the sidebar and dashboard.
 - **CSRF & Parameterization:** Per-session `X-CSRF` header verification on all state-changing actions, strict identifier quoting, and prepared statements for row data.
 - Do not expose to the public internet without HTTPS (TLS) and appropriate network/access restrictions.

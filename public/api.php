@@ -46,10 +46,155 @@ function q(string $id, string $drv): string {
     return $drv === 'mysql' ? '`' . str_replace('`', '``', $id) . '`' : '"' . str_replace('"', '""', $id) . '"';
 }
 
+const SQLITE_EXTS = ['sqlite', 'sqlite3', 'db'];
+
+/** Load config.php (from project root or public/) combined with sensible defaults. */
+function fandejo_config(): array {
+    $cfgFile = is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (is_file(__DIR__ . '/config.php') ? __DIR__ . '/config.php' : null);
+    $raw = $cfgFile ? (require $cfgFile) : [];
+    if (!is_array($raw)) $raw = [];
+    $dirs = $raw['sqlite_dirs'] ?? [dirname(__DIR__) . '/data'];
+    if (is_string($dirs)) $dirs = [$dirs];
+    $cleanDirs = [];
+    foreach ($dirs as $d) {
+        $d = rtrim(trim((string)$d), '/\\');
+        if ($d !== '') $cleanDirs[] = $d;
+    }
+    if (!$cleanDirs) $cleanDirs = [dirname(__DIR__) . '/data'];
+    $users = [];
+    if (!empty($raw['sqlite_users']) && is_array($raw['sqlite_users'])) {
+        foreach ($raw['sqlite_users'] as $u => $h) {
+            if (is_string($u) && $u !== '' && is_string($h) && $h !== '') $users[$u] = $h;
+        }
+    }
+    if (!empty($raw['sqlite_password_hash']) && is_string($raw['sqlite_password_hash'])) {
+        $u = !empty($raw['sqlite_user']) && is_string($raw['sqlite_user']) ? $raw['sqlite_user'] : 'admin';
+        $users[$u] ??= $raw['sqlite_password_hash'];
+    }
+    if (($envHash = getenv('FANDEJO_SQLITE_HASH')) && is_string($envHash)) {
+        $envUser = getenv('FANDEJO_SQLITE_USER') ?: 'admin';
+        $users[$envUser] = $envHash;
+    }
+    return ['cfg_file' => $cfgFile ?? (dirname(__DIR__) . '/config.php'), 'sqlite_dirs' => $cleanDirs, 'sqlite_users' => $users];
+}
+
+function save_sqlite_config(array $dirs, array $users): void {
+    $target = dirname(__DIR__) . '/config.php';
+    $code = "<?php\n// Fandejo Configuration — generated " . date('c') . "\nreturn " . var_export(['sqlite_dirs' => array_values($dirs), 'sqlite_users' => $users], true) . ";\n";
+    if (@file_put_contents($target, $code, LOCK_EX) === false) {
+        fail('Unable to write config.php — check directory permissions or create config.php from config.example.php');
+    }
+    @chmod($target, 0600);
+}
+
+/** Ensure primary SQLite sandbox directory exists and return canonical realpaths of all allowed directories. */
+function sqlite_allowed_dirs(): array {
+    $cfg = fandejo_config();
+    $out = [];
+    foreach ($cfg['sqlite_dirs'] as $i => $d) {
+        if ($i === 0 && !is_dir($d)) @mkdir($d, 0750, true);
+        $real = realpath($d);
+        if ($real !== false && is_dir($real)) $out[] = $real;
+    }
+    return array_values(array_unique($out));
+}
+
+/** Validate a database filename or relative entry and resolve it strictly inside the allowed SQLite sandbox directories. */
+function resolve_sqlite_db(?string $name, bool $allowCreate = false): string {
+    $dirs = sqlite_allowed_dirs();
+    if (!$dirs) fail('No accessible SQLite sandbox directory configured');
+    $name = trim((string)$name);
+    if ($name === '' || $name === 'main') {
+        $existing = list_sqlite_databases();
+        if ($existing) return $existing[0]['path'];
+        $name = 'main.sqlite';
+        $allowCreate = true;
+    }
+    $dirIdx = 0;
+    if (preg_match('/^@(\d+):(.*)$/', $name, $m)) {
+        $dirIdx = (int)$m[1];
+        $name = $m[2];
+    }
+    if (!isset($dirs[$dirIdx])) fail('Invalid SQLite directory index');
+    $baseDir = $dirs[$dirIdx];
+    if (str_contains($name, '/') || str_contains($name, '\\') || str_contains($name, '..') || str_contains($name, "\0")) {
+        fail('Invalid SQLite database name (path traversal is not allowed)');
+    }
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    if ($ext === '') {
+        foreach (SQLITE_EXTS as $tryExt) {
+            if (is_file("$baseDir/$name.$tryExt")) { $name .= ".$tryExt"; $ext = $tryExt; break; }
+        }
+        if ($ext === '') { $name .= '.sqlite'; $ext = 'sqlite'; }
+    }
+    if (!in_array($ext, SQLITE_EXTS, true)) {
+        fail('SQLite database must use .sqlite, .sqlite3, or .db extension');
+    }
+    $stem = pathinfo($name, PATHINFO_FILENAME);
+    if (!preg_match('/^[A-Za-z0-9._-]+$/', $stem)) {
+        fail('SQLite database name may only contain letters, numbers, dots, underscores, and hyphens');
+    }
+    $full = $baseDir . DIRECTORY_SEPARATOR . $name;
+    if (is_file($full)) {
+        $real = realpath($full);
+        if ($real === false || dirname($real) !== $baseDir) fail('Access denied: outside SQLite sandbox directory');
+        return $real;
+    }
+    if (!$allowCreate) {
+        // Also check other allowed dirs if no explicit prefix was given
+        foreach ($dirs as $d) {
+            $alt = $d . DIRECTORY_SEPARATOR . $name;
+            if (is_file($alt) && ($r = realpath($alt)) !== false && dirname($r) === $d) return $r;
+        }
+        fail("SQLite database '$name' not found in allowed sandbox directory");
+    }
+    return $full;
+}
+
+/** Scan all allowed SQLite sandbox directories and return database metadata rows. */
+function list_sqlite_databases(): array {
+    $dirs = sqlite_allowed_dirs();
+    $multi = count($dirs) > 1;
+    $out = [];
+    foreach ($dirs as $idx => $dir) {
+        $items = @scandir($dir) ?: [];
+        foreach ($items as $f) {
+            if ($f === '.' || $f === '..' || str_starts_with($f, '.')) continue;
+            $full = $dir . DIRECTORY_SEPARATOR . $f;
+            if (!is_file($full) || is_link($full)) continue;
+            $ext = strtolower(pathinfo($f, PATHINFO_EXTENSION));
+            if (!in_array($ext, SQLITE_EXTS, true)) continue;
+            $dbName = $multi && $idx > 0 ? "@$idx:$f" : $f;
+            $tables = 0;
+            try {
+                $tp = new PDO('sqlite:' . $full, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+                $tables = (int)$tp->query("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'")->fetchColumn();
+            } catch (Throwable) {}
+            $size = (int)@filesize($full);
+            foreach (['-wal', '-shm'] as $suf) if (is_file($full . $suf)) $size += (int)@filesize($full . $suf);
+            $out[] = [
+                'name' => $dbName,
+                'label' => $f,
+                'dir' => $dir,
+                'path' => $full,
+                'tables' => $tables,
+                'size' => $size,
+                'charset' => 'UTF-8',
+                'collation' => 'BINARY',
+            ];
+        }
+    }
+    usort($out, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+    return $out;
+}
+
 function connect(array $c, ?string $db = null): PDO {
     $opts = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC];
     if ($c['driver'] === 'sqlite') {
-        return new PDO('sqlite:' . $c['path'], null, null, $opts);
+        $path = resolve_sqlite_db($db ?? ($c['db'] ?? ''), true);
+        $pdo = new PDO('sqlite:' . $path, null, null, $opts);
+        $pdo->exec('PRAGMA foreign_keys = ON');
+        return $pdo;
     }
     $dsn = "mysql:host={$c['host']};port={$c['port']};charset=utf8mb4" . ($db ? ";dbname=$db" : '');
     return new PDO($dsn, $c['user'], $c['pass'], $opts);
@@ -143,7 +288,9 @@ function parse_coltype(string $t): array {
 function parse_default(?string $d, bool $nullable, string $extra, bool $maria, string $drv): array {
     if ($drv === 'sqlite') {
         if ($d === null) return ['mode' => 'none', 'value' => ''];
+        if (strtoupper($d) === 'NULL') return ['mode' => 'null', 'value' => ''];
         if (preg_match("/^'(.*)'$/s", $d, $m)) return ['mode' => 'value', 'value' => str_replace("''", "'", $m[1])];
+        if (preg_match('/^\((.*)\)$/s', $d, $m)) return ['mode' => 'expr', 'value' => $m[1]];
         return is_numeric($d) ? ['mode' => 'value', 'value' => $d] : ['mode' => 'expr', 'value' => $d];
     }
     if ($d === null) return ['mode' => $nullable ? 'null' : 'none', 'value' => ''];
@@ -154,18 +301,30 @@ function parse_default(?string $d, bool $nullable, string $extra, bool $maria, s
     }
     return str_contains($extra, 'DEFAULT_GENERATED') ? ['mode' => 'expr', 'value' => $d] : ['mode' => 'value', 'value' => $d];
 }
+/** Normalize default expression across MariaDB/MySQL and SQLite3. */
+function norm_default_expr(string $e, string $drv): string {
+    $e = trim($e);
+    if (!preg_match('/^[A-Za-z_]+(\([\w\s,.\'-]*\))?$/', $e)) throw new InvalidArgumentException('Invalid default expression');
+    if ($drv !== 'sqlite') return $e;
+    $up = strtoupper($e);
+    if (in_array($up, ['CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME'], true)) return $up;
+    if ($up === 'NOW()') return 'CURRENT_TIMESTAMP';
+    if ($up === 'CURDATE()') return 'CURRENT_DATE';
+    if ($up === 'CURTIME()') return 'CURRENT_TIME';
+    return str_contains($e, '(') ? "($e)" : $up;
+}
 /** Build a column definition (type + attributes) from request data. Throws on invalid input. */
-function col_def(PDO $p, string $drv, array $in): string {
+function col_def(PDO $p, string $drv, array $in, bool $forAddColumn = false): string {
     $base = strtoupper(trim((string)($in['type'] ?? '')));
     if (!in_array($base, COL_TYPES, true)) throw new InvalidArgumentException("Unsupported type '$base'");
-    $t = $base;
-    if (in_array($base, ['ENUM', 'SET'], true)) {
+    $t = ($drv === 'sqlite' && in_array($base, ['ENUM', 'SET'], true)) ? 'TEXT' : $base;
+    if ($drv === 'mysql' && in_array($base, ['ENUM', 'SET'], true)) {
         $vals = array_values(array_filter(array_map('strval', $in['values'] ?? []), fn($v) => $v !== ''));
         if (!$vals) throw new InvalidArgumentException("$base needs at least one value");
         $t .= '(' . implode(',', array_map(fn($v) => $p->quote($v), $vals)) . ')';
     } else {
         $len = trim((string)($in['length'] ?? ''));
-        if ($len !== '') {
+        if ($len !== '' && !($drv === 'sqlite' && in_array($base, ['ENUM', 'SET'], true))) {
             if (!preg_match('/^\d+(,\d+)?$/', $len)) throw new InvalidArgumentException('Invalid length');
             $t .= "($len)";
         }
@@ -177,14 +336,19 @@ function col_def(PDO $p, string $drv, array $in): string {
         if (!preg_match('/^[a-z0-9]+_[a-z0-9_]+$/i', $coll)) throw new InvalidArgumentException('Invalid collation');
         $d .= ' CHARACTER SET ' . explode('_', $coll)[0] . ' COLLATE ' . $coll;
     }
-    $d .= empty($in['null']) ? ' NOT NULL' : ' NULL';
     $mode = $in['default_mode'] ?? 'none';
+    if ($drv === 'sqlite' && $forAddColumn && empty($in['null']) && in_array($mode, ['none', 'null'], true)) {
+        throw new InvalidArgumentException('SQLite requires a non-NULL default value when adding a NOT NULL column to an existing table');
+    }
+    if ($drv === 'sqlite' && $forAddColumn && $mode === 'expr') {
+        $ne = norm_default_expr((string)($in['default'] ?? ''), 'sqlite');
+        if (str_starts_with($ne, '(')) throw new InvalidArgumentException('SQLite ADD COLUMN only allows constant defaults or CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME');
+    }
+    $d .= empty($in['null']) ? ' NOT NULL' : ' NULL';
     if ($mode === 'null') $d .= ' DEFAULT NULL';
     elseif ($mode === 'value') $d .= ' DEFAULT ' . $p->quote((string)($in['default'] ?? ''));
     elseif ($mode === 'expr') {
-        $e = trim((string)($in['default'] ?? ''));
-        if (!preg_match('/^[A-Za-z_]+(\([\w\s,.\']*\))?$/', $e)) throw new InvalidArgumentException('Invalid default expression');
-        $d .= " DEFAULT $e";
+        $d .= ' DEFAULT ' . norm_default_expr((string)($in['default'] ?? ''), $drv);
     }
     if ($drv === 'mysql' && !empty($in['on_update']) && in_array($base, ['DATETIME', 'TIMESTAMP'], true)) $d .= ' ON UPDATE CURRENT_TIMESTAMP';
     if ($drv === 'mysql' && !empty($in['ai'])) $d .= ' AUTO_INCREMENT';
@@ -326,14 +490,41 @@ $a = $_GET['a'] ?? '';
 if ($a === 'session') {
     $ok = isset($_SESSION['c']['sealed_pass']) && open_secret($_SESSION['c']['sealed_pass']) !== null;
     if (!$ok && isset($_SESSION['c'])) clear_auth();
-    out(['auth' => $ok, 'driver' => $ok ? $_SESSION['c']['driver'] : null, 'user' => $ok ? $_SESSION['c']['user'] : null]);
+    $cfg = fandejo_config();
+    out([
+        'auth' => $ok,
+        'driver' => $ok ? $_SESSION['c']['driver'] : null,
+        'user' => $ok ? $_SESSION['c']['user'] : null,
+        'sqlite_setup' => empty($cfg['sqlite_users']),
+        'sqlite_dirs' => sqlite_allowed_dirs(),
+    ]);
 }
 if ($a === 'login') {
-    $c = ['driver' => ($in['driver'] ?? 'mysql') === 'sqlite' ? 'sqlite' : 'mysql',
+    $drvIn = ($in['driver'] ?? 'mysql') === 'sqlite' ? 'sqlite' : 'mysql';
+    $c = ['driver' => $drvIn,
           'host' => $in['host'] ?? '127.0.0.1', 'port' => (int)($in['port'] ?? 3306),
-          'user' => $in['user'] ?? '', 'pass' => (string)($in['pass'] ?? ''), 'path' => $in['path'] ?? ''];
-    if ($c['driver'] === 'sqlite' && $c['path'] === '') fail('SQLite file path required');
-    try { connect($c); } catch (Throwable $e) { fail($e->getMessage(), 401); }
+          'user' => trim((string)($in['user'] ?? '')), 'pass' => (string)($in['pass'] ?? ''), 'db' => $in['db'] ?? ''];
+    if ($drvIn === 'sqlite') {
+        $cfg = fandejo_config();
+        if ($c['user'] === '' || $c['pass'] === '') fail('Username and password are required for SQLite access', 401);
+        if (empty($cfg['sqlite_users'])) {
+            if (!empty($in['setup_sqlite'])) {
+                if (strlen($c['pass']) < 6) fail('Password must be at least 6 characters', 400);
+                $hash = password_hash($c['pass'], defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT);
+                save_sqlite_config($cfg['sqlite_dirs'], [$c['user'] => $hash]);
+            } else {
+                fail('SQLite authentication is not configured yet. Enable initial setup or configure sqlite_users in config.php.', 401);
+            }
+        } else {
+            $hash = $cfg['sqlite_users'][$c['user']] ?? null;
+            if (!$hash || !password_verify($c['pass'], $hash)) {
+                fail('Invalid SQLite username or password', 401);
+            }
+        }
+        sqlite_allowed_dirs();
+    } else {
+        try { connect($c); } catch (Throwable $e) { fail($e->getMessage(), 401); }
+    }
     session_regenerate_id(true);
     $sealed = seal_secret($c['pass']);
     unset($c['pass']);
@@ -356,10 +547,65 @@ $db = $in['db'] ?? ($_GET['db'] ?? null);
 $tb = $in['table'] ?? ($_GET['table'] ?? null);
 
 try {
-    $p = connect($c, $drv === 'mysql' ? $db : null);
+    $noConnectActions = ['databases', 'create_db', 'drop_db', 'server_info', 'server_meta', 'change_own_password', 'sqlite_dirs', 'set_sqlite_dirs'];
+    $p = ($drv === 'sqlite' && in_array($a, $noConnectActions, true)) ? null : connect($c, $db);
     $T = $tb !== null ? ($drv === 'mysql' ? q((string)$db, $drv) . '.' : '') . q((string)$tb, $drv) : '';
 
     switch ($a) {
+    case 'sqlite_dirs':
+        if ($drv !== 'sqlite') fail('SQLite mode only');
+        $cfg = fandejo_config();
+        $out = [];
+        foreach ($cfg['sqlite_dirs'] as $d) {
+            $real = realpath($d);
+            $exists = $real !== false && is_dir($real);
+            $pdir = $exists ? $real : $d;
+            $files = 0;
+            if ($exists) {
+                foreach (@scandir($real) ?: [] as $f) {
+                    if ($f !== '.' && $f !== '..' && !str_starts_with($f, '.') && is_file("$real/$f") && in_array(strtolower(pathinfo($f, PATHINFO_EXTENSION)), SQLITE_EXTS, true)) {
+                        $files++;
+                    }
+                }
+            }
+            $out[] = [
+                'path' => $pdir,
+                'exists' => $exists,
+                'readable' => $exists && is_readable($real),
+                'writable' => $exists && is_writable($real),
+                'files' => $files,
+            ];
+        }
+        out(['dirs' => $out]);
+
+    case 'set_sqlite_dirs':
+        if ($drv !== 'sqlite') fail('SQLite mode only');
+        $rawDirs = $in['dirs'] ?? [];
+        if (!is_array($rawDirs)) fail('Invalid directory list');
+        $createMissing = !empty($in['create_missing']);
+        $clean = [];
+        foreach ($rawDirs as $d) {
+            $d = rtrim(trim((string)$d), '/\\');
+            if ($d === '') continue;
+            if (str_contains($d, "\0")) fail('Invalid directory path');
+            if (!str_starts_with($d, '/')) fail("Directory path '$d' must be an absolute path (starting with /)");
+            if (!is_dir($d)) {
+                if ($createMissing) {
+                    if (!@mkdir($d, 0750, true)) fail("Could not create directory '$d' — check filesystem permissions");
+                } else {
+                    fail("Directory '$d' does not exist (enable 'Create missing directories' or create it first)");
+                }
+            }
+            $real = realpath($d);
+            if ($real === false || !is_dir($real)) fail("Unable to resolve directory '$d'");
+            if (!is_readable($real)) fail("Directory '$real' is not readable by PHP user (" . get_current_user() . ")");
+            $clean[] = $real;
+        }
+        $clean = array_values(array_unique($clean));
+        if (!$clean) fail('At least one allowed SQLite directory is required');
+        $cfg = fandejo_config();
+        save_sqlite_config($clean, $cfg['sqlite_users']);
+        out(['ok' => true, 'dirs' => $clean]);
     case 'server_info':
         $info = [
             'driver' => $drv,
@@ -405,24 +651,39 @@ try {
                 'slow_queries' => (int)($stat['Slow_queries'] ?? 0),
             ];
         } else {
-            $ver = (string)$p->query('SELECT sqlite_version()')->fetchColumn();
+            $sp = new PDO('sqlite::memory:');
+            $ver = (string)$sp->query('SELECT sqlite_version()')->fetchColumn();
+            $dirs = sqlite_allowed_dirs();
+            $dbs = list_sqlite_databases();
             $info += [
                 'server_name' => 'SQLite',
                 'server_version' => $ver,
-                'host' => $c['path'],
-                'user' => get_current_user() . '@local',
-                'current_user' => 'file owner',
-                'charset' => (string)$p->query('PRAGMA encoding')->fetchColumn(),
-                'file_size' => is_file($c['path']) ? filesize($c['path']) : 0,
-                'journal_mode' => (string)$p->query('PRAGMA journal_mode')->fetchColumn(),
-                'foreign_keys_on' => (bool)$p->query('PRAGMA foreign_keys')->fetchColumn(),
+                'host' => implode(', ', $dirs),
+                'datadir' => $dirs[0] ?? '',
+                'sqlite_dirs' => $dirs,
+                'user' => $c['user'] . '@fandejo-config',
+                'current_user' => $c['user'] . '@sqlite-sandbox',
+                'my_user' => $c['user'],
+                'my_host' => 'sqlite-sandbox',
+                'charset' => (string)$sp->query('PRAGMA encoding')->fetchColumn(),
+                'file_size' => array_sum(array_column($dbs, 'size')),
+                'journal_mode' => 'WAL',
+                'foreign_keys_on' => true,
             ];
         }
         out($info);
 
     case 'change_own_password':
-        if ($drv !== 'mysql') fail('MySQL/MariaDB only');
         if (($in['pass'] ?? '') === '') fail('Password required');
+        if ($drv === 'sqlite') {
+            if (strlen((string)$in['pass']) < 6) fail('Password must be at least 6 characters');
+            $cfg = fandejo_config();
+            $users = $cfg['sqlite_users'];
+            $users[$c['user']] = password_hash((string)$in['pass'], defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT);
+            save_sqlite_config($cfg['sqlite_dirs'], $users);
+            $_SESSION['c']['sealed_pass'] = seal_secret((string)$in['pass']);
+            out(['ok' => true]);
+        }
         $cu = (string)$p->query('SELECT CURRENT_USER()')->fetchColumn();
         $at = strrpos($cu, '@');
         $u = $at !== false ? substr($cu, 0, $at) : $c['user'];
@@ -432,7 +693,7 @@ try {
         out(['ok' => true]);
 
     case 'databases':
-        if ($drv === 'sqlite') out(['databases' => ['main']]);
+        if ($drv === 'sqlite') out(['databases' => list_sqlite_databases()]);
         $r = rows($p, "SELECT s.SCHEMA_NAME name, s.DEFAULT_CHARACTER_SET_NAME charset, s.DEFAULT_COLLATION_NAME collation, COUNT(t.TABLE_NAME) tables, COALESCE(SUM(t.DATA_LENGTH+t.INDEX_LENGTH),0) size
                        FROM information_schema.SCHEMATA s LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA=s.SCHEMA_NAME GROUP BY s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME ORDER BY 1");
         out(['databases' => $r]);
@@ -458,11 +719,21 @@ try {
         out(['engines' => $engs, 'collations' => $colls, 'default_engine' => $defEng, 'default_collation' => $defColl]);
 
     case 'create_db':
+        if ($drv === 'sqlite') {
+            $rawName = trim((string)($in['name'] ?? ''));
+            if ($rawName === '') fail('Database name required');
+            $path = resolve_sqlite_db($rawName, true);
+            if (is_file($path)) fail('SQLite database file already exists');
+            $np = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $np->exec('PRAGMA journal_mode=WAL; PRAGMA encoding="UTF-8";');
+            $np = null;
+            out(['ok' => true, 'name' => basename($path)]);
+        }
         $coll = trim((string)($in['collation'] ?? 'utf8mb4_unicode_ci'));
         if ($coll !== '' && !preg_match('/^[a-z0-9]+_[a-z0-9_]+$/i', $coll)) fail('Invalid collation');
         $cs = $coll !== '' ? explode('_', $coll)[0] : 'utf8mb4';
         $p->exec('CREATE DATABASE ' . q($in['name'], $drv) . " CHARACTER SET $cs" . ($coll !== '' ? " COLLATE $coll" : ''));
-        out(['ok' => true]);
+        out(['ok' => true, 'name' => $in['name']]);
 
     case 'alter_db':
         if ($drv !== 'mysql') fail('MySQL/MariaDB only');
@@ -509,6 +780,12 @@ try {
         out(['ok' => true, 'statements' => $stmts, 'converted_tables' => $tblCount, 'fk_guards' => count($fkDrops), 'warnings' => $warnings]);
 
     case 'drop_db':
+        if ($drv === 'sqlite') {
+            $path = resolve_sqlite_db((string)$db, false);
+            if (!@unlink($path)) fail('Unable to delete SQLite database file');
+            foreach (['-wal', '-shm', '-journal'] as $suf) if (is_file($path . $suf)) @unlink($path . $suf);
+            out(['ok' => true]);
+        }
         $p->exec('DROP DATABASE ' . q($db, $drv)); out(['ok' => true]);
 
     case 'tables':
@@ -523,10 +800,27 @@ try {
 
     case 'structure':
         if ($drv === 'sqlite') {
-            $cols = array_map(fn($x) => ['name' => $x['name'], 'type' => $x['type'], 'null' => !$x['notnull'], 'key' => $x['pk'] ? 'PRI' : '', 'default' => $x['dflt_value'], 'extra' => '', 'parsed' => parse_coltype($x['type']), 'def' => parse_default($x['dflt_value'], !$x['notnull'], '', false, 'sqlite'), 'ai' => false, 'on_update' => false, 'collation' => null, 'comment' => ''],
-                rows($p, 'PRAGMA table_info(' . q($tb, $drv) . ')'));
+            $create = (string)$p->query("SELECT sql FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn();
+            $hasAi = stripos($create, 'AUTOINCREMENT') !== false;
+            $cols = array_map(function ($x) use ($hasAi) {
+                $pt = parse_coltype($x['type']);
+                $isIntPk = $x['pk'] > 0 && in_array($pt['base'], ['INTEGER', 'INT'], true);
+                return [
+                    'name' => $x['name'],
+                    'type' => $x['type'],
+                    'null' => !$x['notnull'] && !$x['pk'],
+                    'key' => $x['pk'] ? 'PRI' : '',
+                    'default' => $x['dflt_value'],
+                    'extra' => ($isIntPk && $hasAi) ? 'AUTOINCREMENT' : ($isIntPk ? 'rowid auto' : ''),
+                    'parsed' => $pt,
+                    'def' => parse_default($x['dflt_value'], !$x['notnull'], '', false, 'sqlite'),
+                    'ai' => $isIntPk,
+                    'on_update' => false,
+                    'collation' => null,
+                    'comment' => '',
+                ];
+            }, rows($p, 'PRAGMA table_info(' . q($tb, $drv) . ')'));
             $idx = rows($p, 'PRAGMA index_list(' . q($tb, $drv) . ')');
-            $create = $p->query("SELECT sql FROM sqlite_master WHERE name=" . $p->quote($tb))->fetchColumn();
         } else {
             $maria = stripos((string)$p->query('SELECT VERSION()')->fetchColumn(), 'mariadb') !== false;
             $cols = array_map(function ($x) use ($maria, $drv) {
@@ -542,13 +836,14 @@ try {
 
     case 'browse':
         $page = max(1, (int)($in['page'] ?? 1)); $per = min(500, max(5, (int)($in['per'] ?? 50)));
+        $isView = $drv === 'sqlite' && strtolower((string)$p->query("SELECT type FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn()) === 'view';
         $rawCols = rows($p, $drv === 'sqlite' ? 'PRAGMA table_info(' . q($tb, $drv) . ')' : "SHOW COLUMNS FROM $T");
         $cols = array_column($rawCols, $drv === 'sqlite' ? 'name' : 'Field');
         $colMeta = [];
         foreach ($rawCols as $rc) {
             $cn = $drv === 'sqlite' ? $rc['name'] : $rc['Field'];
             $ct = $drv === 'sqlite' ? $rc['type'] : $rc['Type'];
-            $colMeta[$cn] = parse_coltype($ct) + ['raw_type' => $ct, 'null' => $drv === 'sqlite' ? !$rc['notnull'] : ($rc['Null'] === 'YES')];
+            $colMeta[$cn] = parse_coltype($ct) + ['raw_type' => $ct, 'null' => $drv === 'sqlite' ? (!$rc['notnull'] && !$rc['pk']) : ($rc['Null'] === 'YES')];
         }
         $where = ''; $args = [];
         if (!empty($in['search'])) {
@@ -559,15 +854,27 @@ try {
         $order = '';
         if (!empty($in['sort']) && in_array($in['sort'], $cols, true)) $order = ' ORDER BY ' . q($in['sort'], $drv) . (($in['dir'] ?? '') === 'desc' ? ' DESC' : ' ASC');
         $total = (int)rows($p, "SELECT COUNT(*) n FROM $T$where", $args)[0]['n'];
-        $data = rows($p, "SELECT * FROM $T$where$order LIMIT $per OFFSET " . (($page - 1) * $per), $args);
         $pk = [];
-        if ($drv === 'sqlite') { foreach ($rawCols as $x) if ($x['pk']) $pk[] = $x['name']; }
-        else { foreach ($rawCols as $x) if ($x['Key'] === 'PRI') $pk[] = $x['Field']; }
+        $useRowid = false;
+        if ($drv === 'sqlite') {
+            foreach ($rawCols as $x) if ($x['pk']) $pk[] = $x['name'];
+            if (!$pk && !$isView) {
+                try {
+                    $p->query("SELECT rowid FROM $T LIMIT 1");
+                    $pk = ['__rowid__'];
+                    $useRowid = true;
+                } catch (Throwable) {}
+            }
+        } else {
+            foreach ($rawCols as $x) if ($x['Key'] === 'PRI') $pk[] = $x['Field'];
+        }
+        $selCols = $useRowid ? 'rowid AS "__rowid__", *' : '*';
+        $data = rows($p, "SELECT $selCols FROM $T$where$order LIMIT $per OFFSET " . (($page - 1) * $per), $args);
         out(['rows' => $data, 'columns' => $cols, 'col_meta' => $colMeta, 'total' => $total, 'pk' => $pk, 'page' => $page, 'per' => $per]);
 
     case 'insert':
         $v = $in['values'] ?? [];
-        if (!$v) { $p->exec("INSERT INTO $T DEFAULT VALUES"); out(['ok' => true]); }
+        if (!$v) { $p->exec($drv === 'sqlite' ? "INSERT INTO $T DEFAULT VALUES" : "INSERT INTO $T () VALUES ()"); out(['ok' => true]); }
         $names = implode(',', array_map(fn($k) => q($k, $drv), array_keys($v)));
         $ph = implode(',', array_fill(0, count($v), '?'));
         $p->prepare("INSERT INTO $T ($names) VALUES ($ph)")->execute(array_values($v)); out(['ok' => true]);
@@ -577,21 +884,43 @@ try {
         $key = $in['key'] ?? [];
         if (!$key) fail('Table has no primary key; use the SQL editor');
         $w = []; $args = [];
-        foreach ($key as $k => $val) { if ($val === null) $w[] = q($k, $drv) . ' IS NULL'; else { $w[] = q($k, $drv) . ' = ?'; $args[] = $val; } }
+        foreach ($key as $k => $val) {
+            $colSql = ($drv === 'sqlite' && $k === '__rowid__') ? 'rowid' : q((string)$k, $drv);
+            if ($val === null) $w[] = "$colSql IS NULL";
+            else { $w[] = "$colSql = ?"; $args[] = $val; }
+        }
         $w = implode(' AND ', $w);
-        if ($a === 'delete') { $s = $p->prepare("DELETE FROM $T WHERE $w LIMIT 1"); if ($drv === 'sqlite') $s = $p->prepare("DELETE FROM $T WHERE $w"); $s->execute($args); out(['ok' => true]); }
+        if ($a === 'delete') { $s = $p->prepare("DELETE FROM $T WHERE $w" . ($drv === 'mysql' ? ' LIMIT 1' : '')); $s->execute($args); out(['ok' => true]); }
         $v = $in['values'] ?? [];
         $set = implode(',', array_map(fn($k) => q($k, $drv) . ' = ?', array_keys($v)));
         $s = $p->prepare("UPDATE $T SET $set WHERE $w"); $s->execute(array_merge(array_values($v), $args)); out(['ok' => true]);
 
     case 'query':
         $results = [];
-        // naive split on ; outside quotes
+        // split on ; outside quotes and SQL comments
         $stmts = []; $buf = ''; $qt = null; $sql = (string)$in['sql'];
         for ($i = 0, $n = strlen($sql); $i < $n; $i++) {
             $ch = $sql[$i];
-            if ($qt) { if ($ch === '\\' && $qt !== '`') { $buf .= $ch . ($sql[++$i] ?? ''); continue; } if ($ch === $qt) $qt = null; }
-            elseif ($ch === "'" || $ch === '"' || $ch === '`') $qt = $ch;
+            if ($qt) {
+                if ($ch === '\\' && $qt !== '`' && $drv === 'mysql') { $buf .= $ch . ($sql[++$i] ?? ''); continue; }
+                if ($ch === $qt) {
+                    if (($qt === "'" || $qt === '"' || $qt === '`') && ($sql[$i + 1] ?? '') === $qt) { $buf .= $ch . $sql[++$i]; continue; }
+                    $qt = null;
+                }
+                $buf .= $ch;
+                continue;
+            }
+            if ($ch === '-' && ($sql[$i + 1] ?? '') === '-') {
+                $nl = strpos($sql, "\n", $i + 2);
+                if ($nl === false) break;
+                $buf .= "\n"; $i = $nl; continue;
+            }
+            if ($ch === '/' && ($sql[$i + 1] ?? '') === '*') {
+                $end = strpos($sql, '*/', $i + 2);
+                if ($end === false) break;
+                $i = $end + 1; continue;
+            }
+            if ($ch === "'" || $ch === '"' || $ch === '`') $qt = $ch;
             elseif ($ch === ';') { if (trim($buf) !== '') $stmts[] = $buf; $buf = ''; continue; }
             $buf .= $ch;
         }
@@ -602,31 +931,55 @@ try {
         }
         out(['results' => $results]);
 
-    case 'drop_table': $p->exec("DROP TABLE $T"); out(['ok' => true]);
-    case 'truncate': $p->exec($drv === 'mysql' ? "TRUNCATE TABLE $T" : "DELETE FROM $T"); out(['ok' => true]);
+    case 'drop_table':
+        $isV = $drv === 'sqlite'
+            ? strtolower((string)$p->query("SELECT type FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn()) === 'view'
+            : stripos((string)(rows($p, "SELECT TABLE_TYPE t FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", [$db, $tb])[0]['t'] ?? ''), 'VIEW') !== false;
+        $p->exec('DROP ' . ($isV ? 'VIEW ' : 'TABLE ') . $T);
+        out(['ok' => true]);
+
+    case 'truncate':
+        if ($drv === 'mysql') {
+            $p->exec("TRUNCATE TABLE $T");
+        } else {
+            $p->exec("DELETE FROM $T");
+            try { $p->exec('DELETE FROM sqlite_sequence WHERE name=' . $p->quote((string)$tb)); } catch (Throwable) {}
+        }
+        out(['ok' => true]);
+
     case 'rename_table':
         $p->exec($drv === 'mysql' ? "RENAME TABLE $T TO " . q((string)$db, $drv) . '.' . q($in['to'], $drv) : "ALTER TABLE $T RENAME TO " . q($in['to'], $drv)); out(['ok' => true]);
 
     case 'create_table':
         // columns: [{name,type,length,null,pk,ai,default,default_mode,on_update}]
+        $colsIn = array_values($in['columns'] ?? []);
+        $pkCount = count(array_filter($colsIn, fn($c) => !empty($c['pk'])));
         $defs = []; $pks = [];
         $exprs = ['CURRENT_TIMESTAMP', 'NOW()', 'CURDATE()', 'CURRENT_DATE', 'CURTIME()', 'CURRENT_TIME', 'UUID()'];
-        foreach ($in['columns'] ?? [] as $col) {
+        $sqliteInts = ['INT', 'INTEGER', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'BIGINT'];
+        foreach ($colsIn as $col) {
             $type = strtoupper($col['type'] ?? 'INT');
             if (!in_array($type, COL_TYPES, true)) fail("Unsupported type $type");
+            if ($drv === 'sqlite' && in_array($type, ['ENUM', 'SET'], true)) $type = 'TEXT';
             $len = trim((string)($col['length'] ?? ''));
             if ($len !== '' && !preg_match('/^\d+(,\d+)?$/', $len)) fail('Invalid length');
-            $d = q($col['name'], $drv) . ' ' . $type . ($len !== '' ? "($len)" : '');
-            if (empty($col['null'])) $d .= ' NOT NULL'; else $d .= ' NULL';
-            if (!empty($col['ai'])) $d .= $drv === 'mysql' ? ' AUTO_INCREMENT' : '';
+            $isSqliteSinglePk = $drv === 'sqlite' && $pkCount === 1 && !empty($col['pk']);
+            if ($isSqliteSinglePk && (!empty($col['ai']) || in_array($type, $sqliteInts, true))) {
+                // SQLite requires exact `INTEGER PRIMARY KEY [AUTOINCREMENT]` syntax immediately after the type
+                $d = q($col['name'], $drv) . ' INTEGER PRIMARY KEY' . (!empty($col['ai']) ? ' AUTOINCREMENT' : '');
+                if (empty($col['null'])) $d .= ' NOT NULL';
+            } else {
+                $d = q($col['name'], $drv) . ' ' . $type . ($len !== '' ? "($len)" : '');
+                if ($isSqliteSinglePk) $d .= ' PRIMARY KEY';
+                if (empty($col['null'])) $d .= ' NOT NULL'; else $d .= ' NULL';
+                if (!empty($col['ai']) && $drv === 'mysql') $d .= ' AUTO_INCREMENT';
+            }
             $defVal = trim((string)($col['default'] ?? ''));
             $defMode = $col['default_mode'] ?? '';
             if ($defMode === 'null' || strtoupper($defVal) === 'NULL') {
                 $d .= ' DEFAULT NULL';
-            } elseif ($defMode === 'expr' || in_array(strtoupper($defVal), $exprs, true)) {
-                $e = strtoupper($defVal ?: 'CURRENT_TIMESTAMP');
-                if (!preg_match('/^[A-Za-z_]+(\([\w\s,.\']*\))?$/', $e)) fail('Invalid default expression');
-                $d .= " DEFAULT $e";
+            } elseif ($defMode === 'expr' || in_array(strtoupper($defVal), $exprs, true) || ($drv === 'sqlite' && str_contains($defVal, '('))) {
+                $d .= ' DEFAULT ' . norm_default_expr($defVal ?: 'CURRENT_TIMESTAMP', $drv);
             } elseif ($defVal !== '') {
                 $d .= ' DEFAULT ' . $p->quote($defVal);
             }
@@ -637,9 +990,9 @@ try {
             $defs[] = $d;
         }
         if (!$defs) fail('At least one column required');
-        if ($drv === 'sqlite' && count($pks) === 1) {
-            foreach ($defs as $i => $d) if (str_starts_with($d, $pks[0] . ' ')) $defs[$i] .= ' PRIMARY KEY' . (!empty($in['columns'][$i]['ai']) ? ' AUTOINCREMENT' : '');
-        } elseif ($pks) $defs[] = 'PRIMARY KEY (' . implode(',', $pks) . ')';
+        if ($pks && !($drv === 'sqlite' && $pkCount === 1)) {
+            $defs[] = 'PRIMARY KEY (' . implode(',', $pks) . ')';
+        }
         $tail = '';
         if ($drv === 'mysql') {
             $eng = trim((string)($in['engine'] ?? ''));
@@ -699,10 +1052,11 @@ try {
     case 'alter_column':
         $name = trim((string)($in['name'] ?? ''));
         if ($name === '') fail('Column name required');
-        $def = col_def($p, $drv, $in);
         if ($a === 'add_column') {
+            $def = col_def($p, $drv, $in, true);
             $sql = "ALTER TABLE $T ADD COLUMN " . q($name, $drv) . " $def" . col_pos($drv, $in);
         } elseif ($drv === 'mysql') {
+            $def = col_def($p, $drv, $in, false);
             $sql = "ALTER TABLE $T CHANGE COLUMN " . q((string)$in['column'], $drv) . ' ' . q($name, $drv) . " $def" . col_pos($drv, $in);
         } else {
             if ($name === $in['column']) fail('SQLite can only rename columns; other changes need a table rebuild (use the SQL editor).');
