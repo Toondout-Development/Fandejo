@@ -37,7 +37,7 @@ function engineSelectOpts(sel) {
     return list.map(e => `<option value="${esc(e)}" ${e === sel ? 'selected' : ''}>${esc(e)}</option>`).join('');
 }
 
-const S = { driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '' }, sql: '' };
+const S = { driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, sql: '' };
 
 async function api(a, body = {}) {
     const r = await fetch('api.php?a=' + a, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify(body) });
@@ -180,7 +180,7 @@ function tree() {
     }).join('') || `<div class="empty">${S.driver === 'sqlite' ? 'No SQLite files in sandbox yet' : 'Nothing found'}</div>`;
     el.querySelectorAll('.node').forEach(n => n.onclick = guard(async () => {
         S.db = n.dataset.db; S.table = n.dataset.tb || null; S.tab = S.table ? 'browse' : 'tables';
-        S.browse = { ...S.browse, page: 1, per: getPrefs().perPage, sort: '', search: '' };
+        S.browse = { ...S.browse, page: 1, per: getPrefs().perPage, sort: '', search: '', filters: [], showFilterBar: false };
         if (!S.tables[S.db] || !S.table) await loadTables(S.db);
         render();
     }));
@@ -208,25 +208,86 @@ async function tablesView() {
     C().innerHTML = `${my && dbObj?.collation ? `<div class="bar"><span class="badge">Database Collation: <b>${esc(dbObj.collation)}</b></span><button class="ghost" id="edbc">Change…</button></div>` : ''}
       ${t.length ? `<div class="tw"><table><tr><th>Table</th><th>Type</th>${my ? '<th>Engine</th><th>Collation</th>' : ''}<th>Rows</th><th>Size</th><th></th></tr>${t.map(x => `<tr><td><a href="#" data-t="${esc(x.name)}" style="color:var(--accent)"><b>${esc(x.name)}</b></a>${x.comment ? `<br><small style="color:var(--mute)">${esc(x.comment)}</small>` : ''}</td><td>${esc(x.type)}</td>${my ? `<td>${esc(x.engine ?? '–')}</td><td><small>${esc(x.collation ?? '–')}</small></td>` : ''}<td>${x.rows ?? '–'}</td><td>${fmtSize(x.size)}</td><td class="act"><button data-d="${esc(x.name)}" class="danger">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No tables yet</div>'}`;
     if ($('#edbc')) $('#edbc').onclick = () => { S.tab = 'dropdb'; render(); };
-    C().querySelectorAll('[data-t]').forEach(a => a.onclick = e => { e.preventDefault(); S.table = a.dataset.t; S.tab = 'browse'; render(); });
+    C().querySelectorAll('[data-t]').forEach(a => a.onclick = e => { e.preventDefault(); S.table = a.dataset.t; S.tab = 'browse'; S.browse = { ...S.browse, page: 1, sort: '', search: '', filters: [], showFilterBar: false }; render(); });
     C().querySelectorAll('[data-d]').forEach(b => b.onclick = () => confirmDo(`Drop table ${b.dataset.d}?`, async () => { await api('drop_table', { db: S.db, table: b.dataset.d }); await loadTables(S.db); render(); }));
 }
 
+const FILTER_OPS = [
+    ['=', '= (equals)', true],
+    ['!=', '!= (not equal)', true],
+    ['CONTAINS', 'contains (%val%)', true],
+    ['STARTS', 'starts with (val%)', true],
+    ['ENDS', 'ends with (%val)', true],
+    ['LIKE', 'LIKE (custom %)', true],
+    ['NOT LIKE', 'NOT LIKE', true],
+    ['>', '> (greater than)', true],
+    ['>=', '>= (at least)', true],
+    ['<', '< (less than)', true],
+    ['<=', '<= (at most)', true],
+    ['IN', 'IN (comma-separated)', true],
+    ['NOT IN', 'NOT IN (comma-separated)', true],
+    ['IS NULL', 'IS NULL', false],
+    ['IS NOT NULL', 'IS NOT NULL', false],
+    ['EMPTY', "is empty ('')", false],
+    ['NOT EMPTY', 'is not empty', false],
+];
+const opNeedsVal = op => FILTER_OPS.find(o => o[0] === op)?.[2] !== false;
+
 async function browse() {
-    const B = S.browse, r = await api('browse', { db: S.db, table: S.table, ...B });
+    const B = S.browse;
+    B.filters ??= [];
+    const r = await api('browse', { db: S.db, table: S.table, ...B });
     const pages = Math.max(1, Math.ceil(r.total / r.per));
     const keyCols = r.key_cols?.length ? r.key_cols : r.pk;
     const canEdit = !r.is_view && keyCols.length > 0;
     const uk = r.uk || [];
     const noKeyNotice = r.key_type === 'all' ? `<span class="badge warn" title="This table has no PRIMARY or UNIQUE key. Edits and deletes match all column values${S.driver === 'mysql' ? ' (with LIMIT 1)' : ''}.">⚠ No PK (full-row match)</span>` : '';
-    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:260px"><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search and sort as CSV">⬇ CSV</button><span class="spacer"></span>
+
+    const defCol = r.columns[0] || '';
+    const filterBarHtml = (B.showFilterBar || B.filters.length > 0) ? `<div class="dash-card" style="padding:10px 14px;margin-bottom:12px">
+      <div class="bar" style="margin-bottom:${B.filters.length ? '8px' : '0'}">
+        <small style="color:var(--mute);font-weight:700;text-transform:uppercase;letter-spacing:.04em">WHERE Filter</small>
+        <select id="f-col">${r.columns.map(c => `<option value="${esc(c)}" ${c === (B.draftCol || defCol) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+        <select id="f-op">${FILTER_OPS.map(([k, l]) => `<option value="${esc(k)}" ${k === (B.draftOp || '=') ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <input id="f-val" placeholder="Value…" value="${esc(B.draftVal || '')}" ${opNeedsVal(B.draftOp || '=') ? '' : 'hidden'} style="width:200px">
+        <button class="primary" id="f-add">+ Apply</button>
+        ${B.filters.length || B.search ? `<button class="ghost danger" id="f-clr">Clear all</button>` : ''}
+      </div>
+      ${B.filters.length ? `<div class="chips" style="margin-top:4px">${B.filters.map((f, idx) => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;border-color:var(--accent)"><b>${esc(f.col)}</b> <span style="color:var(--accent)">${esc(f.op)}</span> ${opNeedsVal(f.op) ? `<code>${esc(f.val)}</code>` : ''}<a href="#" data-rmf="${idx}" style="color:var(--danger);text-decoration:none;font-weight:700" title="Remove filter">✕</a></span>`).join('')}</div>` : ''}
+    </div>` : '';
+
+    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:230px"><button id="btf" class="${B.filters.length ? 'primary' : ''}" title="Filter by specific column (uses indexes)">⧩ Filter${B.filters.length ? ` (${B.filters.length})` : ''}</button><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search, filters, and sort as CSV">⬇ CSV</button><span class="spacer"></span>
       <button id="pp" ${B.page <= 1 ? 'disabled' : ''}>‹</button><span>Page ${r.page} / ${pages}</span><button id="np" ${B.page >= pages ? 'disabled' : ''}>›</button>
       <select id="per">${[25, 50, 100, 250].map(n => `<option ${n === r.per ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+      ${filterBarHtml}
       <div class="tw"><table><tr>${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
       ${r.rows.map((row, i) => `<tr>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
       ${r.rows.length ? '' : '<div class="empty">No rows</div>'}`;
     $('#bs').onkeydown = e => { if (e.key === 'Enter') { B.search = e.target.value; B.page = 1; render(); } };
-    $('#bcsv').onclick = guard(() => exportCSV({ table: S.table, search: B.search, sort: B.sort, dir: B.dir, header: true, delimiter: ',' }));
+    $('#btf').onclick = () => { B.showFilterBar = !B.showFilterBar; render(); };
+    if ($('#f-op')) {
+        const syncOp = () => {
+            B.draftCol = $('#f-col').value;
+            B.draftOp = $('#f-op').value;
+            $('#f-val').hidden = !opNeedsVal(B.draftOp);
+        };
+        $('#f-col').onchange = syncOp;
+        $('#f-op').onchange = syncOp;
+        const applyFilter = () => {
+            const col = $('#f-col').value, op = $('#f-op').value, val = $('#f-val').value;
+            if (!col) return;
+            B.filters.push({ col, op, val: opNeedsVal(op) ? val : '' });
+            B.draftVal = '';
+            B.page = 1;
+            render();
+        };
+        $('#f-add').onclick = applyFilter;
+        $('#f-val').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); applyFilter(); } };
+        $('#f-val').oninput = e => { B.draftVal = e.target.value; };
+    }
+    if ($('#f-clr')) $('#f-clr').onclick = () => { B.filters = []; B.search = ''; B.page = 1; render(); };
+    C().querySelectorAll('[data-rmf]').forEach(a => a.onclick = e => { e.preventDefault(); B.filters.splice(+a.dataset.rmf, 1); B.page = 1; render(); });
+    $('#bcsv').onclick = guard(() => exportCSV({ table: S.table, search: B.search, filters: B.filters, sort: B.sort, dir: B.dir, header: true, delimiter: ',' }));
     $('#pp').onclick = () => { B.page--; render(); }; $('#np').onclick = () => { B.page++; render(); };
     $('#per').onchange = e => { B.per = +e.target.value; B.page = 1; render(); };
     C().querySelectorAll('th[data-c]').forEach(th => th.onclick = () => { B.dir = B.sort === th.dataset.c && B.dir === 'asc' ? 'desc' : 'asc'; B.sort = th.dataset.c; render(); });

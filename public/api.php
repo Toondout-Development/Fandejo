@@ -764,14 +764,72 @@ function binary_relabel_table_sql(PDO $p, string $db, string $tb, string $cs, st
 function table_cols(PDO $p, string $drv, string $T, ?string $tb): array {
     return array_column(rows($p, $drv === 'sqlite' ? 'PRAGMA table_info(' . q((string)$tb, $drv) . ')' : "SHOW COLUMNS FROM $T"), $drv === 'sqlite' ? 'name' : 'Field');
 }
-/** WHERE / ORDER BY for the table browser search+sort; fills $args. */
+/** WHERE / ORDER BY for the table browser search, column filters, and sort; fills $args. */
 function filter_sql(string $drv, array $cols, array $in, array &$args): array {
-    $where = ''; $args = [];
+    $clauses = []; $args = [];
     if (($in['search'] ?? '') !== '') {
         $parts = [];
         foreach ($cols as $col) { $parts[] = 'CAST(' . q($col, $drv) . ' AS ' . ($drv === 'mysql' ? 'CHAR' : 'TEXT') . ') LIKE ?'; $args[] = '%' . $in['search'] . '%'; }
-        $where = ' WHERE ' . implode(' OR ', $parts);
+        if ($parts) $clauses[] = '(' . implode(' OR ', $parts) . ')';
     }
+    if (!empty($in['filters']) && is_array($in['filters'])) {
+        foreach ($in['filters'] as $f) {
+            if (!is_array($f)) continue;
+            $col = (string)($f['col'] ?? '');
+            if (!in_array($col, $cols, true)) continue;
+            $op = strtoupper(trim((string)($f['op'] ?? '=')));
+            $val = (string)($f['val'] ?? '');
+            $qc = q($col, $drv);
+            switch ($op) {
+                case '=':
+                case '!=':
+                case '<':
+                case '<=':
+                case '>':
+                case '>=':
+                    $clauses[] = "$qc $op ?";
+                    $args[] = $val;
+                    break;
+                case 'LIKE':
+                case 'NOT LIKE':
+                    $clauses[] = "$qc $op ?";
+                    $args[] = $val;
+                    break;
+                case 'CONTAINS':
+                    $clauses[] = "$qc LIKE ?";
+                    $args[] = "%$val%";
+                    break;
+                case 'STARTS':
+                    $clauses[] = "$qc LIKE ?";
+                    $args[] = "$val%";
+                    break;
+                case 'ENDS':
+                    $clauses[] = "$qc LIKE ?";
+                    $args[] = "%$val";
+                    break;
+                case 'IN':
+                case 'NOT IN':
+                    $items = array_values(array_filter(array_map('trim', explode(',', $val)), fn($x) => $x !== ''));
+                    if ($items) {
+                        $ph = implode(',', array_fill(0, count($items), '?'));
+                        $clauses[] = "$qc $op ($ph)";
+                        array_push($args, ...$items);
+                    }
+                    break;
+                case 'IS NULL':
+                case 'IS NOT NULL':
+                    $clauses[] = "$qc $op";
+                    break;
+                case 'EMPTY':
+                    $clauses[] = "$qc = ''";
+                    break;
+                case 'NOT EMPTY':
+                    $clauses[] = "($qc IS NOT NULL AND $qc != '')";
+                    break;
+            }
+        }
+    }
+    $where = $clauses ? ' WHERE ' . implode(' AND ', $clauses) : '';
     $order = (!empty($in['sort']) && in_array($in['sort'], $cols, true)) ? ' ORDER BY ' . q($in['sort'], $drv) . (($in['dir'] ?? '') === 'desc' ? ' DESC' : ' ASC') : '';
     return [$where, $order];
 }
@@ -1209,14 +1267,8 @@ try {
             $ct = $drv === 'sqlite' ? $rc['type'] : $rc['Type'];
             $colMeta[$cn] = parse_coltype($ct) + ['raw_type' => $ct, 'null' => $drv === 'sqlite' ? (!$rc['notnull'] && !$rc['pk']) : ($rc['Null'] === 'YES')];
         }
-        $where = ''; $args = [];
-        if (!empty($in['search'])) {
-            $parts = [];
-            foreach ($cols as $col) { $parts[] = ($drv === 'mysql' ? 'CAST(' . q($col, $drv) . ' AS CHAR)' : 'CAST(' . q($col, $drv) . ' AS TEXT)') . ' LIKE ?'; $args[] = '%' . $in['search'] . '%'; }
-            $where = ' WHERE ' . implode(' OR ', $parts);
-        }
-        $order = '';
-        if (!empty($in['sort']) && in_array($in['sort'], $cols, true)) $order = ' ORDER BY ' . q($in['sort'], $drv) . (($in['dir'] ?? '') === 'desc' ? ' DESC' : ' ASC');
+        $args = [];
+        [$where, $order] = filter_sql($drv, $cols, $in, $args);
         $total = (int)rows($p, "SELECT COUNT(*) n FROM $T$where", $args)[0]['n'];
         $pk = [];
         $uk = [];

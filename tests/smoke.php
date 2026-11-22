@@ -102,7 +102,10 @@ call('add_fk', ['db' => $dbName, 'table' => 'u', 'ref_table' => 'x', 'pairs' => 
 call('drop_index', ['db' => $dbName, 'table' => 'u', 'name' => 'idx_name']);
 call('indexes', ['db' => $dbName, 'table' => 'u']);
 call('import_rows', ['db' => $dbName, 'table' => 'u', 'columns' => ['name', 'years'], 'rows' => [['charlie', '30'], ['dave', ''], ['bob', '25']], 'mode' => 'insert', 'empty_null' => true]);
-call('browse', ['db' => $dbName, 'table' => 'u']);
+$bf = call('browse', ['db' => $dbName, 'table' => 'u', 'filters' => [['col' => 'years', 'op' => '>=', 'val' => '25'], ['col' => 'name', 'op' => 'IN', 'val' => 'charlie, bob']]]);
+if (($bf['total'] ?? 0) !== 2) { echo "  [FAIL] Column filter expected 2 rows, got " . ($bf['total'] ?? 'null') . "\n"; $failures++; }
+$bfNull = call('browse', ['db' => $dbName, 'table' => 'u', 'filters' => [['col' => 'years', 'op' => 'IS NULL']]]);
+if (($bfNull['total'] ?? 0) !== 1) { echo "  [FAIL] IS NULL filter expected 1 row, got " . ($bfNull['total'] ?? 'null') . "\n"; $failures++; }
 call('export_csv', ['db' => $dbName, 'table' => 'u', 'delimiter' => ',', 'header' => true, 'null_as' => 'NULL']);
 call('server_info');
 
