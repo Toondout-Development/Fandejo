@@ -1331,7 +1331,53 @@ try {
         }
         $selCols = $useRowid ? 'rowid AS "__rowid__", *' : '*';
         $data = rows($p, "SELECT $selCols FROM $T$where$order LIMIT $per OFFSET " . (($page - 1) * $per), $args);
-        out(['rows' => $data, 'columns' => $cols, 'col_meta' => $colMeta, 'total' => $total, 'pk' => $pk, 'uk' => $uk, 'key_cols' => $keyCols, 'key_type' => $keyType, 'is_view' => $isView, 'page' => $page, 'per' => $per]);
+        $fkMap = [];
+        foreach (list_fks($p, $drv, $db, $tb) as $f) {
+            foreach ($f['pairs'] as $pr) {
+                $fkMap[$pr['col']] = [
+                    'ref_db' => $f['ref_db'] ?: $db,
+                    'ref_table' => $f['ref_table'],
+                    'ref_col' => $pr['ref'],
+                ];
+            }
+        }
+        out(['rows' => $data, 'columns' => $cols, 'col_meta' => $colMeta, 'fks' => $fkMap, 'total' => $total, 'pk' => $pk, 'uk' => $uk, 'key_cols' => $keyCols, 'key_type' => $keyType, 'is_view' => $isView, 'page' => $page, 'per' => $per]);
+
+    case 'fk_lookup':
+        $refDb = (string)($in['ref_db'] ?? $db);
+        $refTb = (string)($in['ref_table'] ?? '');
+        $refCol = (string)($in['ref_col'] ?? '');
+        if ($refTb === '' || $refCol === '') fail('Referenced table and column required');
+        $RT = ($drv === 'mysql' ? q($refDb, $drv) . '.' : '') . q($refTb, $drv);
+        $rCols = table_cols($p, $drv, $RT, $refTb);
+        if (!in_array($refCol, $rCols, true)) fail("Column '$refCol' not found in '$refTb'");
+        // Pick up to 2 descriptive display columns alongside the referenced key column
+        $labelCols = array_slice(array_values(array_filter($rCols, fn($c) => $c !== $refCol)), 0, 2);
+        $selList = implode(', ', array_map(fn($c) => q($c, $drv), array_merge([$refCol], $labelCols)));
+        $qSearch = trim((string)($in['q'] ?? ''));
+        $w = ''; $wArgs = [];
+        if ($qSearch !== '') {
+            $parts = [];
+            foreach (array_merge([$refCol], $labelCols) as $sc) {
+                $parts[] = 'CAST(' . q($sc, $drv) . ' AS ' . ($drv === 'mysql' ? 'CHAR' : 'TEXT') . ') LIKE ?';
+                $wArgs[] = "%$qSearch%";
+            }
+            $w = ' WHERE ' . implode(' OR ', $parts);
+        }
+        $lRows = rows($p, "SELECT $selList FROM $RT$w ORDER BY " . q($refCol, $drv) . " ASC LIMIT 200", $wArgs);
+        $items = [];
+        foreach ($lRows as $lr) {
+            $v = $lr[$refCol];
+            $desc = [];
+            foreach ($labelCols as $lc) {
+                if (($lr[$lc] ?? null) !== null && (string)$lr[$lc] !== '') {
+                    $s = (string)$lr[$lc];
+                    $desc[] = strlen($s) > 40 ? substr($s, 0, 40) . '…' : $s;
+                }
+            }
+            $items[] = ['val' => $v, 'label' => $desc ? implode(' · ', $desc) : ''];
+        }
+        out(['items' => $items, 'ref_table' => $refTb, 'ref_col' => $refCol]);
 
     case 'insert':
         $v = $in['values'] ?? [];

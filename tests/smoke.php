@@ -113,6 +113,8 @@ $bupd2 = call('bulk_update', ['db' => $dbName, 'table' => 'u', 'updates' => [['k
 if (($bupd2['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_update (individual) expected 2 rows updated, got " . ($bupd2['affected'] ?? 'null') . "\n"; $failures++; }
 $bdel = call('bulk_delete', ['db' => $dbName, 'table' => 'u', 'keys' => [['id' => 3], ['id' => 4]]]);
 if (($bdel['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_delete expected 2 rows deleted, got " . ($bdel['affected'] ?? 'null') . "\n"; $failures++; }
+$fkl = call('fk_lookup', ['db' => $dbName, 'ref_table' => 'u', 'ref_col' => 'id', 'q' => 'bob']);
+if (count($fkl['items'] ?? []) !== 1) { echo "  [FAIL] fk_lookup expected 1 matching item for 'bob'\n"; $failures++; }
 call('export_csv', ['db' => $dbName, 'table' => 'u', 'delimiter' => ',', 'header' => true, 'null_as' => 'NULL']);
 call('server_info');
 

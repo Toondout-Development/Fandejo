@@ -37,7 +37,7 @@ function engineSelectOpts(sel) {
     return list.map(e => `<option value="${esc(e)}" ${e === sel ? 'selected' : ''}>${esc(e)}</option>`).join('');
 }
 
-const S = { driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, sql: '' };
+const S = { driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, fkBack: [], sql: '' };
 
 async function api(a, body = {}) {
     const r = await fetch('api.php?a=' + a, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify(body) });
@@ -180,6 +180,7 @@ function tree() {
     }).join('') || `<div class="empty">${S.driver === 'sqlite' ? 'No SQLite files in sandbox yet' : 'Nothing found'}</div>`;
     el.querySelectorAll('.node').forEach(n => n.onclick = guard(async () => {
         S.db = n.dataset.db; S.table = n.dataset.tb || null; S.tab = S.table ? 'browse' : 'tables';
+        S.fkBack = [];
         S.browse = { ...S.browse, page: 1, per: getPrefs().perPage, sort: '', search: '', filters: [], showFilterBar: false };
         if (!S.tables[S.db] || !S.table) await loadTables(S.db);
         render();
@@ -188,8 +189,8 @@ function tree() {
 function render() {
     tree();
     $('#crumbs').innerHTML = S.db ? `<a href="#" id="chome" class="crumb">Fandejo</a> / <a href="#" id="cdb" class="crumb">${esc(S.db)}</a>${S.table ? ' / <b>' + esc(S.table) + '</b>' : ''}` : '<b>Fandejo</b> <span style="color:var(--mute)">/ Foundry Dashboard</span>';
-    if ($('#chome')) $('#chome').onclick = e => { e.preventDefault(); S.db = null; S.table = null; S.tab = 'home'; render(); };
-    if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
+    if ($('#chome')) $('#chome').onclick = e => { e.preventDefault(); S.fkBack = []; S.db = null; S.table = null; S.tab = 'home'; render(); };
+    if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.fkBack = []; S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
         : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
             : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL']];
@@ -208,7 +209,7 @@ async function tablesView() {
     C().innerHTML = `${my && dbObj?.collation ? `<div class="bar"><span class="badge">Database Collation: <b>${esc(dbObj.collation)}</b></span><button class="ghost" id="edbc">Change…</button></div>` : ''}
       ${t.length ? `<div class="tw"><table><tr><th>Table</th><th>Type</th>${my ? '<th>Engine</th><th>Collation</th>' : ''}<th>Rows</th><th>Size</th><th></th></tr>${t.map(x => `<tr><td><a href="#" data-t="${esc(x.name)}" style="color:var(--accent)"><b>${esc(x.name)}</b></a>${x.comment ? `<br><small style="color:var(--mute)">${esc(x.comment)}</small>` : ''}</td><td>${esc(x.type)}</td>${my ? `<td>${esc(x.engine ?? '–')}</td><td><small>${esc(x.collation ?? '–')}</small></td>` : ''}<td>${x.rows ?? '–'}</td><td>${fmtSize(x.size)}</td><td class="act"><button data-d="${esc(x.name)}" class="danger">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No tables yet</div>'}`;
     if ($('#edbc')) $('#edbc').onclick = () => { S.tab = 'dropdb'; render(); };
-    C().querySelectorAll('[data-t]').forEach(a => a.onclick = e => { e.preventDefault(); S.table = a.dataset.t; S.tab = 'browse'; S.browse = { ...S.browse, page: 1, sort: '', search: '', filters: [], showFilterBar: false }; render(); });
+    C().querySelectorAll('[data-t]').forEach(a => a.onclick = e => { e.preventDefault(); S.fkBack = []; S.table = a.dataset.t; S.tab = 'browse'; S.browse = { ...S.browse, page: 1, sort: '', search: '', filters: [], showFilterBar: false }; render(); });
     C().querySelectorAll('[data-d]').forEach(b => b.onclick = () => confirmDo(`Drop table ${b.dataset.d}?`, async () => { await api('drop_table', { db: S.db, table: b.dataset.d }); await loadTables(S.db); render(); }));
 }
 
@@ -241,6 +242,7 @@ async function browse() {
     const keyCols = r.key_cols?.length ? r.key_cols : r.pk;
     const canEdit = !r.is_view && keyCols.length > 0;
     const uk = r.uk || [];
+    const fkMap = r.fks || {};
     const noKeyNotice = r.key_type === 'all' ? `<span class="badge warn" title="This table has no PRIMARY or UNIQUE key. Edits and deletes match all column values${S.driver === 'mysql' ? ' (with LIMIT 1)' : ''}.">⚠ No PK (full-row match)</span>` : '';
 
     const defCol = r.columns[0] || '';
@@ -256,7 +258,9 @@ async function browse() {
       ${B.filters.length ? `<div class="chips" style="margin-top:4px">${B.filters.map((f, idx) => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;border-color:var(--accent)"><b>${esc(f.col)}</b> <span style="color:var(--accent)">${esc(f.op)}</span> ${opNeedsVal(f.op) ? `<code>${esc(f.val)}</code>` : ''}<a href="#" data-rmf="${idx}" style="color:var(--danger);text-decoration:none;font-weight:700" title="Remove filter">✕</a></span>`).join('')}</div>` : ''}
     </div>` : '';
 
-    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:230px"><button id="btf" class="${B.filters.length ? 'primary' : ''}" title="Filter by specific column (uses indexes)">⧩ Filter${B.filters.length ? ` (${B.filters.length})` : ''}</button><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search, filters, and sort as CSV">⬇ CSV</button>
+    const prevNav = S.fkBack?.length ? S.fkBack[S.fkBack.length - 1] : null;
+    const backBtnHtml = prevNav ? `<button id="fk-back" class="primary" title="Return to ${esc(prevNav.db !== S.db ? prevNav.db + '.' : '')}${esc(prevNav.table)} (${esc(prevNav.viaCol)} = ${esc(prevNav.viaVal)})">← Back to ${esc(prevNav.table)}</button>` : '';
+    C().innerHTML = `<div class="bar">${backBtnHtml}<input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:230px"><button id="btf" class="${B.filters.length ? 'primary' : ''}" title="Filter by specific column (uses indexes)">⧩ Filter${B.filters.length ? ` (${B.filters.length})` : ''}</button><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search, filters, and sort as CSV">⬇ CSV</button>
       <span id="bulk-bar" class="row" hidden style="margin-left:6px;padding-left:10px;border-left:1px solid var(--line)">
         <span class="badge" id="bulk-cnt">0 selected</span>
         ${canEdit ? `<button id="bulk-edit" class="primary" title="Edit selected rows (batch or individually)">✎ Edit</button>` : ''}
@@ -268,8 +272,17 @@ async function browse() {
       <button id="pp" ${B.page <= 1 ? 'disabled' : ''}>‹</button><span>Page ${r.page} / ${pages}</span><button id="np" ${B.page >= pages ? 'disabled' : ''}>›</button>
       <select id="per">${[25, 50, 100, 250].map(n => `<option ${n === r.per ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
       ${filterBarHtml}
-      <div class="tw"><table><tr>${r.rows.length ? `<th style="width:1%;cursor:default"><input type="checkbox" id="sel-all" title="Select all rows on this page"></th>` : ''}${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
-      ${r.rows.map((row, i) => `<tr data-ri="${i}"><td><input type="checkbox" class="rchk" data-i="${i}"></td>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost" data-cp="${i}" title="Copy / duplicate row">⧉</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? `<td class="null" data-cell="${i}" data-col="${esc(c)}" title="${canEdit ? 'Double-click to edit inline' : ''}">NULL</td>` : `<td data-cell="${i}" data-col="${esc(c)}" title="${esc(row[c])}${canEdit ? ' (Double-click to edit)' : ''}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
+      <div class="tw"><table><tr>${r.rows.length ? `<th style="width:1%;cursor:default"><input type="checkbox" id="sel-all" title="Select all rows on this page"></th>` : ''}${canEdit ? '<th></th>' : ''}${r.columns.map(c => {
+          const fk = fkMap[c];
+          const fkIcon = fk ? `<span style="color:var(--cyan)" title="Foreign key → ${esc(fk.ref_table)}.${esc(fk.ref_col)}">🔗</span> ` : '';
+          return `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${fkIcon}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`;
+      }).join('')}</tr>
+      ${r.rows.map((row, i) => `<tr data-ri="${i}"><td><input type="checkbox" class="rchk" data-i="${i}"></td>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost" data-cp="${i}" title="Copy / duplicate row">⧉</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => {
+          if (row[c] === null) return `<td class="null" data-cell="${i}" data-col="${esc(c)}" title="${canEdit ? 'Double-click to edit inline' : ''}">NULL</td>`;
+          const fk = fkMap[c];
+          const fkLink = fk ? ` <a href="#" class="crumb" data-fk-col="${esc(c)}" data-fk-val="${esc(row[c])}" title="Jump to ${esc(fk.ref_table)}.${esc(fk.ref_col)} = ${esc(row[c])}" style="font-size:11px;margin-left:4px">↗</a>` : '';
+          return `<td data-cell="${i}" data-col="${esc(c)}" title="${esc(row[c])}${canEdit ? ' (Double-click to edit)' : ''}">${esc(row[c])}${fkLink}</td>`;
+      }).join('')}</tr>`).join('')}</table></div>
       ${r.rows.length ? '' : '<div class="empty">No rows</div>'}`;
     $('#bs').onkeydown = e => { if (e.key === 'Enter') { B.search = e.target.value; B.page = 1; render(); } };
     $('#btf').onclick = () => { B.showFilterBar = !B.showFilterBar; render(); };
@@ -375,12 +388,51 @@ async function browse() {
             });
         };
     }
+    const jumpToFk = async (colName, val) => {
+        const fk = fkMap[colName];
+        if (!fk) return;
+        S.fkBack ??= [];
+        S.fkBack.push({
+            db: S.db,
+            table: S.table,
+            viaCol: colName,
+            viaVal: val,
+            browse: JSON.parse(JSON.stringify(S.browse)),
+        });
+        const targetDb = fk.ref_db || S.db;
+        if (targetDb !== S.db) {
+            S.db = targetDb;
+            await loadTables(S.db);
+        }
+        S.table = fk.ref_table;
+        S.tab = 'browse';
+        S.browse = { ...S.browse, page: 1, sort: '', search: '', filters: [{ col: fk.ref_col, op: '=', val }], showFilterBar: true };
+        render();
+    };
+    if ($('#fk-back')) {
+        $('#fk-back').onclick = guard(async () => {
+            const prev = S.fkBack.pop();
+            if (!prev) return;
+            if (prev.db !== S.db) {
+                S.db = prev.db;
+                await loadTables(S.db);
+            }
+            S.table = prev.table;
+            S.tab = 'browse';
+            S.browse = prev.browse;
+            render();
+        });
+    }
+    C().querySelectorAll('[data-fk-col]').forEach(a => a.onclick = guard(async e => {
+        e.preventDefault(); e.stopPropagation();
+        await jumpToFk(a.dataset.fkCol, a.dataset.fkVal);
+    }));
     C().querySelectorAll('[data-x]').forEach(b => b.onclick = () => confirmDo(r.key_type === 'all' ? 'Delete this row? (Table has no primary/unique key — matching all column values)' : 'Delete this row?', async () => { await api('delete', { db: S.db, table: S.table, key: keyOf(r.rows[b.dataset.x]) }); render(); }));
     C().querySelectorAll('[data-cp]').forEach(b => b.onclick = () => {
         const row = r.rows[b.dataset.cp];
         const meta = r.col_meta || {};
         modal(`<div style="width:min(600px,80vw)"><h3>⧉ Copy / Duplicate row</h3><p style="color:var(--mute);font-size:12px;margin-top:0">Pre-filled from selected row. Auto-increment primary keys are skipped by default so a new ID is assigned.</p>${r.columns.map(c => {
-            const m = meta[c] || { base: 'VARCHAR' };
+            const m = { ...(meta[c] || { base: 'VARCHAR' }), fk: fkMap[c] };
             const isAiPk = !!m.ai || (r.pk.length === 1 && r.pk.includes(c) && ['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT'].includes((m.base || '').toUpperCase()));
             return renderFieldInput(c, m, isAiPk ? '' : row[c], true, m.extra || (isAiPk ? 'auto_increment' : ''), isAiPk || row[c] === null);
         }).join('')}</div>`, async f => {
@@ -448,7 +500,14 @@ async function browse() {
                         td.textContent = 'NULL';
                     } else {
                         td.className = '';
-                        td.textContent = String(val);
+                        const fk = fkMap[col];
+                        const fkLink = fk ? ` <a href="#" class="crumb" data-fk-col="${esc(col)}" data-fk-val="${esc(val)}" title="Jump to ${esc(fk.ref_table)}.${esc(fk.ref_col)} = ${esc(val)}" style="font-size:11px;margin-left:4px">↗</a>` : '';
+                        td.innerHTML = esc(val) + fkLink;
+                        const a = td.querySelector('[data-fk-col]');
+                        if (a) a.onclick = guard(async e => {
+                            e.preventDefault(); e.stopPropagation();
+                            await jumpToFk(a.dataset.fkCol, a.dataset.fkVal);
+                        });
                         td.title = `${val} (Double-click to edit)`;
                     }
                 };
@@ -490,7 +549,7 @@ async function browse() {
         const row = r.rows[b.dataset.e];
         const meta = r.col_meta || {};
         const warnHtml = r.key_type === 'all' ? `<div class="msg" style="margin-top:0">This table has no primary or unique key; matching row by all current column values${S.driver === 'mysql' ? ' (<code>LIMIT 1</code>)' : ''}.</div>` : '';
-        modal(`<div style="width:min(600px,80vw)"><h3>Edit row</h3>${warnHtml}${r.columns.map(c => renderFieldInput(c, meta[c] || { base: 'VARCHAR' }, row[c], false)).join('')}</div>`, async f => {
+        modal(`<div style="width:min(600px,80vw)"><h3>Edit row</h3>${warnHtml}${r.columns.map(c => renderFieldInput(c, { ...(meta[c] || { base: 'VARCHAR' }), fk: fkMap[c] }, row[c], false)).join('')}</div>`, async f => {
             const values = {};
             r.columns.forEach(c => {
                 const base = (meta[c]?.base || '').toUpperCase();
@@ -544,14 +603,19 @@ function renderFieldInput(name, pt, val, isInsert = false, extra = '', hasDef = 
     } else {
         inputHtml = `<input name="v_${esc(fn)}" value="${esc(vStr)}" style="flex:1">`;
     }
+    const fkBtn = pt?.fk
+        ? `<button type="button" data-fk-pick="${esc(fn)}" data-ref-db="${esc(pt.fk.ref_db || S.db)}" data-ref-tb="${esc(pt.fk.ref_table)}" data-ref-col="${esc(pt.fk.ref_col)}" title="Pick value from ${esc(pt.fk.ref_table)}.${esc(pt.fk.ref_col)}">🔗 Pick</button>`
+        : '';
     const toggleBox = isInsert
         ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(fn)}" ${/auto_?increment|rowid auto/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
         : `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="n_${esc(fn)}" ${isNull ? 'checked' : ''}>NULL</label>`;
-    return `<label>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}</small><div class="row" style="position:relative">${inputHtml}${toggleBox}</div></label>`;
+    const fkBadge = pt?.fk ? ` <span style="color:var(--cyan)" title="Foreign key">→ ${esc(pt.fk.ref_table)}.${esc(pt.fk.ref_col)}</span>` : '';
+    return `<label>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}${fkBadge}</small><div class="row" style="position:relative">${inputHtml}${fkBtn}${toggleBox}</div></label>`;
 }
 
 function openBulkEditModal(selRows, r, keyOf) {
     const meta = r.col_meta || {};
+    const fkMap = r.fks || {};
     const rowLabel = (row, idx) => {
         const k = keyOf(row);
         const parts = Object.entries(k).filter(([c]) => c !== '__rowid__').slice(0, 3).map(([c, v]) => `${c}=${v ?? 'NULL'}`);
@@ -562,7 +626,7 @@ function openBulkEditModal(selRows, r, keyOf) {
       <h3>Edit ${selRows.length} selected row(s)</h3>
       <div style="display:flex;flex-direction:column;gap:12px">
         ${selRows.map((row, idx) => `<fieldset class="pg" style="margin:0"><legend><b>${esc(rowLabel(row, idx))}</b></legend>
-          <div class="form">${r.columns.map(c => renderFieldInput(c, meta[c] || { base: 'VARCHAR' }, row[c], false, '', false, `r${idx}_`)).join('')}</div>
+          <div class="form">${r.columns.map(c => renderFieldInput(c, { ...(meta[c] || { base: 'VARCHAR' }), fk: fkMap[c] }, row[c], false, '', false, `r${idx}_`)).join('')}</div>
         </fieldset>`).join('')}
       </div>
     </div>`, async f => {
@@ -591,7 +655,7 @@ function openBulkEditModal(selRows, r, keyOf) {
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 let activeCal = null;
 function closeCal() { if (activeCal) { activeCal.remove(); activeCal = null; } }
-document.addEventListener('mousedown', e => { if (activeCal && !activeCal.contains(e.target) && !e.target.closest('[data-cal]')) closeCal(); });
+document.addEventListener('mousedown', e => { if (activeCal && !activeCal.contains(e.target) && !e.target.closest('[data-cal],[data-fk-pick]')) closeCal(); });
 
 function openCalPicker(btn, inp, withTime, onPick) {
     if (activeCal && activeCal._inp === inp) return closeCal();
@@ -680,6 +744,54 @@ function openCalPicker(btn, inp, withTime, onPick) {
     btn.parentElement.appendChild(pop);
 }
 
+function openFkPicker(btn, inp, onPick) {
+    if (activeCal && activeCal._inp === inp) return closeCal();
+    closeCal();
+    const refDb = btn.dataset.refDb || S.db, refTb = btn.dataset.refTb, refCol = btn.dataset.refCol;
+    const pop = document.createElement('div');
+    pop.className = 'cal-pop';
+    pop.style.width = '340px';
+    pop._inp = inp;
+    activeCal = pop;
+
+    pop.innerHTML = `<div class="bar" style="margin-bottom:6px">
+        <b style="font-size:12px">🔗 ${esc(refTb)}.${esc(refCol)}</b>
+        <span class="spacer"></span>
+        <button type="button" class="ghost" id="fk-x" style="padding:2px 6px">✕</button>
+      </div>
+      <input id="fk-q" placeholder="Search ${esc(refTb)}…" style="width:100%;margin-bottom:6px;font-size:12px;padding:5px 8px">
+      <div id="fk-list" style="max-height:210px;overflow:auto;display:flex;flex-direction:column;gap:3px"><div class="empty" style="padding:12px">Loading…</div></div>`;
+
+    btn.parentElement.appendChild(pop);
+    pop.querySelector('#fk-x').onclick = closeCal;
+    const qInp = pop.querySelector('#fk-q'), listEl = pop.querySelector('#fk-list');
+    qInp.focus();
+
+    let timer;
+    const loadItems = async (q = '') => {
+        try {
+            const res = await api('fk_lookup', { db: S.db, ref_db: refDb, ref_table: refTb, ref_col: refCol, q });
+            if (!res.items.length) {
+                listEl.innerHTML = `<div class="empty" style="padding:12px">No matching rows in ${esc(refTb)}</div>`;
+                return;
+            }
+            listEl.innerHTML = res.items.map(it => `<button type="button" class="ghost" data-fkv="${esc(it.val)}" style="text-align:left;display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg)">
+              <b style="color:var(--accent);font-family:var(--font-mono)">${esc(it.val)}</b>
+              <span style="color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px">${esc(it.label)}</span>
+            </button>`).join('');
+            listEl.querySelectorAll('[data-fkv]').forEach(b => b.onclick = () => {
+                inp.value = b.dataset.fkv;
+                onPick();
+                closeCal();
+            });
+        } catch (e) {
+            listEl.innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+        }
+    };
+    qInp.oninput = () => { clearTimeout(timer); timer = setTimeout(() => loadItems(qInp.value), 160); };
+    loadItems();
+}
+
 function wireFieldInputs(root) {
     root.querySelectorAll('[data-now]').forEach(b => b.onclick = () => {
         const inp = root.elements['v_' + b.dataset.now];
@@ -693,6 +805,14 @@ function wireFieldInputs(root) {
         const col = b.dataset.cal, inp = root.elements['v_' + col];
         if (!inp) return;
         openCalPicker(b, inp, ['DATETIME', 'TIMESTAMP'].includes(b.dataset.base), () => {
+            const chk = root.elements['n_' + col] || root.elements['s_' + col];
+            if (chk) chk.checked = false;
+        });
+    });
+    root.querySelectorAll('[data-fk-pick]').forEach(b => b.onclick = () => {
+        const col = b.dataset.fkPick, inp = root.elements['v_' + col];
+        if (!inp) return;
+        openFkPicker(b, inp, () => {
             const chk = root.elements['n_' + col] || root.elements['s_' + col];
             if (chk) chk.checked = false;
         });
@@ -1033,8 +1153,14 @@ async function sqlView() {
 }
 
 async function insertView() {
-    const r = await api('structure', { db: S.db, table: S.table });
-    C().innerHTML = `<form class="form" id="if" style="max-width:620px">${r.columns.map(c => renderFieldInput(c.name, { ...c.parsed, raw_type: c.type }, '', true, c.extra, c.def.mode !== 'none')).join('')}<button class="primary">Insert</button></form>`;
+    const [r, fkRes] = await Promise.all([api('structure', { db: S.db, table: S.table }), api('foreign_keys', { db: S.db, table: S.table }).catch(() => ({ foreign_keys: [] }))]);
+    const fkMap = {};
+    for (const f of (fkRes.foreign_keys || [])) {
+        for (const pr of (f.pairs || [])) {
+            fkMap[pr.col] = { ref_db: f.ref_db || S.db, ref_table: f.ref_table, ref_col: pr.ref };
+        }
+    }
+    C().innerHTML = `<form class="form" id="if" style="max-width:620px">${r.columns.map(c => renderFieldInput(c.name, { ...c.parsed, raw_type: c.type, fk: fkMap[c.name] }, '', true, c.extra, c.def.mode !== 'none')).join('')}<button class="primary">Insert</button></form>`;
     wireFieldInputs($('#if'));
     $('#if').onsubmit = guard(async e => {
         e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)), values = {};
