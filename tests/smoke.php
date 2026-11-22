@@ -115,6 +115,14 @@ $bdel = call('bulk_delete', ['db' => $dbName, 'table' => 'u', 'keys' => [['id' =
 if (($bdel['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_delete expected 2 rows deleted, got " . ($bdel['affected'] ?? 'null') . "\n"; $failures++; }
 $fkl = call('fk_lookup', ['db' => $dbName, 'ref_table' => 'u', 'ref_col' => 'id', 'q' => 'bob']);
 if (count($fkl['items'] ?? []) !== 1) { echo "  [FAIL] fk_lookup expected 1 matching item for 'bob'\n"; $failures++; }
+// Test Views & Triggers
+call('save_view', ['db' => $dbName, 'name' => 'v_users', 'select' => 'SELECT id, name FROM u']);
+$vst = call('structure', ['db' => $dbName, 'table' => 'v_users']);
+if (empty($vst['is_view'])) { echo "  [FAIL] Expected v_users structure to report is_view=true\n"; $failures++; }
+call('create_trigger', ['db' => $dbName, 'name' => 'trg_u_ins', 'table' => 'u', 'timing' => 'AFTER', 'event' => 'INSERT', 'body' => 'UPDATE u SET years = 10 WHERE id = NEW.id AND years IS NULL;']);
+$trList = call('triggers', ['db' => $dbName, 'table' => 'u']);
+if (count($trList['triggers'] ?? []) !== 1) { echo "  [FAIL] Expected 1 trigger on table u\n"; $failures++; }
+call('drop_trigger', ['db' => $dbName, 'name' => 'trg_u_ins']);
 call('export_csv', ['db' => $dbName, 'table' => 'u', 'delimiter' => ',', 'header' => true, 'null_as' => 'NULL']);
 call('server_info');
 

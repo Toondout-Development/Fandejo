@@ -192,12 +192,12 @@ function render() {
     if ($('#chome')) $('#chome').onclick = e => { e.preventDefault(); S.fkBack = []; S.db = null; S.table = null; S.tab = 'home'; render(); };
     if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.fkBack = []; S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
-        : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
+        : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['routines', S.driver === 'mysql' ? 'Views / Routines / Triggers' : 'Views & Triggers'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
             : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL'], ['export', 'Export DB'], ['import', 'Import DB']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
     $('#tabs').querySelectorAll('.tab').forEach(t => t.onclick = () => { S.tab = t.dataset.k; render(); });
-    const view = { home: dbsHome, browse, structure, sql: sqlView, insert: insertView, ops, tables: tablesView, newtable: newTable, export: exportView, import: importView, dropdb, users }[S.tab];
+    const view = { home: dbsHome, browse, structure, sql: sqlView, insert: insertView, ops, tables: tablesView, newtable: newTable, routines: dbObjectsView, export: exportView, import: importView, dropdb, users }[S.tab];
     guard(view)();
 }
 const C = () => $('#content');
@@ -206,11 +206,13 @@ const C = () => $('#content');
 async function tablesView() {
     const t = S.tables[S.db] || [], my = S.driver === 'mysql';
     const dbObj = S.dbs.find(d => d.name === S.db);
-    C().innerHTML = `${my && dbObj?.collation ? `<div class="bar"><span class="badge">Database Collation: <b>${esc(dbObj.collation)}</b></span><button class="ghost" id="edbc">Change…</button></div>` : ''}
-      ${t.length ? `<div class="tw"><table><tr><th>Table</th><th>Type</th>${my ? '<th>Engine</th><th>Collation</th>' : ''}<th>Rows</th><th>Size</th><th></th></tr>${t.map(x => `<tr><td><a href="#" data-t="${esc(x.name)}" style="color:var(--accent)"><b>${esc(x.name)}</b></a>${x.comment ? `<br><small style="color:var(--mute)">${esc(x.comment)}</small>` : ''}</td><td>${esc(x.type)}</td>${my ? `<td>${esc(x.engine ?? '–')}</td><td><small>${esc(x.collation ?? '–')}</small></td>` : ''}<td>${x.rows ?? '–'}</td><td>${fmtSize(x.size)}</td><td class="act"><button data-d="${esc(x.name)}" class="danger">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No tables yet</div>'}`;
+    C().innerHTML = `<div class="bar">${my && dbObj?.collation ? `<span class="badge">Database Collation: <b>${esc(dbObj.collation)}</b></span><button class="ghost" id="edbc">Change…</button>` : ''}<span class="spacer"></span><button id="nv-btn">+ New View</button><button class="primary" id="nt-btn">+ New Table</button></div>
+      ${t.length ? `<div class="tw"><table><tr><th>Table / View</th><th>Type</th>${my ? '<th>Engine</th><th>Collation</th>' : ''}<th>Rows</th><th>Size</th><th></th></tr>${t.map(x => `<tr><td><a href="#" data-t="${esc(x.name)}" style="color:var(--accent)"><b>${x.type?.includes('VIEW') || x.type === 'view' ? '👁 ' : ''}${esc(x.name)}</b></a>${x.comment ? `<br><small style="color:var(--mute)">${esc(x.comment)}</small>` : ''}</td><td>${esc(x.type)}</td>${my ? `<td>${esc(x.engine ?? '–')}</td><td><small>${esc(x.collation ?? '–')}</small></td>` : ''}<td>${x.rows ?? '–'}</td><td>${fmtSize(x.size)}</td><td class="act"><button data-d="${esc(x.name)}" class="danger">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No tables yet</div>'}`;
     if ($('#edbc')) $('#edbc').onclick = () => { S.tab = 'dropdb'; render(); };
+    if ($('#nt-btn')) $('#nt-btn').onclick = () => { S.tab = 'newtable'; render(); };
+    if ($('#nv-btn')) $('#nv-btn').onclick = () => viewEditor();
     C().querySelectorAll('[data-t]').forEach(a => a.onclick = e => { e.preventDefault(); S.fkBack = []; S.table = a.dataset.t; S.tab = 'browse'; S.browse = { ...S.browse, page: 1, sort: '', search: '', filters: [], showFilterBar: false }; render(); });
-    C().querySelectorAll('[data-d]').forEach(b => b.onclick = () => confirmDo(`Drop table ${b.dataset.d}?`, async () => { await api('drop_table', { db: S.db, table: b.dataset.d }); await loadTables(S.db); render(); }));
+    C().querySelectorAll('[data-d]').forEach(b => b.onclick = () => confirmDo(`Drop ${b.dataset.d}?`, async () => { await api('drop_table', { db: S.db, table: b.dataset.d }); await loadTables(S.db); render(); }));
 }
 
 const FILTER_OPS = [
@@ -840,26 +842,179 @@ const T_LEN = ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT', 'DECIMAL', '
 const COLLATIONS = ['utf8mb4_unicode_ci', 'utf8mb4_general_ci', 'utf8mb4_bin', 'utf8mb4_0900_ai_ci', 'utf8mb3_general_ci', 'latin1_swedish_ci', 'latin1_general_ci'];
 
 async function structure() {
-    const [r, ix, fk] = await Promise.all([api('structure', { db: S.db, table: S.table }), api('indexes', { db: S.db, table: S.table }), api('foreign_keys', { db: S.db, table: S.table })]);
+    const [r, ix, fk, tr] = await Promise.all([
+        api('structure', { db: S.db, table: S.table }),
+        api('indexes', { db: S.db, table: S.table }),
+        api('foreign_keys', { db: S.db, table: S.table }),
+        api('triggers', { db: S.db, table: S.table }).catch(() => ({ triggers: [] })),
+    ]);
     const my = S.driver === 'mysql';
+    const isView = !!r.is_view;
     const isSingleCol = r.columns.length <= 1;
-    C().innerHTML = `<div class="bar"><button class="primary" id="ac">+ Add column</button></div><div class="tw"><table><tr><th>#</th><th>Name</th><th>Type</th><th>Null</th><th>Key</th><th>Default</th><th>Extra</th>${my ? '<th>Comment</th>' : ''}<th></th></tr>${r.columns.map((c, i) => {
+    C().innerHTML = `${isView ? `<div class="bar"><span class="badge">👁 SQL View</span><button class="primary" id="ev-btn">✎ Edit View Definition</button></div>` : `<div class="bar"><button class="primary" id="ac">+ Add column</button></div>`}
+    <div class="tw"><table><tr><th>#</th><th>Name</th><th>Type</th><th>Null</th><th>Key</th><th>Default</th><th>Extra</th>${my ? '<th>Comment</th>' : ''}${!isView ? '<th></th>' : ''}</tr>${r.columns.map((c, i) => {
         const cantDropSqlite = !my && (c.key === 'PRI' || isSingleCol);
         const dropTitle = !my && c.key === 'PRI' ? 'SQLite cannot drop a PRIMARY KEY column without rebuilding the table' : (isSingleCol ? 'Cannot drop the only column in a table' : '');
-        return `<tr><td>${i + 1}</td><td><b>${c.key === 'PRI' ? '<span class="pk">🔑</span> ' : ''}${esc(c.name)}</b></td><td>${esc(c.type)}</td><td>${c.null ? 'YES' : 'NO'}</td><td>${esc(c.key)}</td><td>${c.def.mode === 'null' ? '<i>NULL</i>' : c.def.mode === 'none' ? '<i style="color:var(--mute)">none</i>' : esc(c.def.value)}</td><td>${esc(c.extra)}</td>${my ? `<td>${esc(c.comment)}</td>` : ''}<td class="act"><button class="ghost" data-ec="${i}">${my ? 'Edit' : 'Rename'}</button><button class="danger ghost" data-dc="${esc(c.name)}" ${cantDropSqlite ? `disabled title="${esc(dropTitle)}"` : ''}>Drop</button></td></tr>`;
+        return `<tr><td>${i + 1}</td><td><b>${c.key === 'PRI' ? '<span class="pk">🔑</span> ' : ''}${esc(c.name)}</b></td><td>${esc(c.type)}</td><td>${c.null ? 'YES' : 'NO'}</td><td>${esc(c.key)}</td><td>${c.def.mode === 'null' ? '<i>NULL</i>' : c.def.mode === 'none' ? '<i style="color:var(--mute)">none</i>' : esc(c.def.value)}</td><td>${esc(c.extra)}</td>${my ? `<td>${esc(c.comment)}</td>` : ''}${!isView ? `<td class="act"><button class="ghost" data-ec="${i}">${my ? 'Edit' : 'Rename'}</button><button class="danger ghost" data-dc="${esc(c.name)}" ${cantDropSqlite ? `disabled title="${esc(dropTitle)}"` : ''}>Drop</button></td>` : ''}</tr>`;
     }).join('')}</table></div>
-    <div class="bar" style="margin-top:22px"><h3 style="margin:0">Indexes</h3><span class="spacer"></span><button id="ai">+ Add index</button></div>
+    ${!isView ? `<div class="bar" style="margin-top:22px"><h3 style="margin:0">Indexes</h3><span class="spacer"></span><button id="ai">+ Add index</button></div>
     ${ix.indexes.length ? `<div class="tw"><table><tr><th>Name</th><th>Type</th><th>Columns</th><th>Method</th><th>Cardinality</th><th></th></tr>${ix.indexes.map((i, n) => `<tr><td><b>${esc(i.name)}</b></td><td><span class="lvl lvl-${i.type === 'PRIMARY' ? 'global' : i.type === 'UNIQUE' ? 'table' : 'database'}">${i.type}</span></td><td>${i.columns.map(c => `<span class="chip">${esc(c.name)}${c.length ? `(${esc(c.length)})` : ''}${c.desc ? ' ↓' : ''}</span>`).join(' ')}</td><td>${esc(i.method)}</td><td>${esc(i.cardinality ?? '–')}</td><td class="act">${i.droppable ? `<button class="danger ghost" data-di="${n}">Drop</button>` : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No indexes</div>'}
     <div class="bar" style="margin-top:22px"><h3 style="margin:0">Foreign keys</h3><span class="spacer"></span><button id="af" ${fk.supported ? '' : 'disabled title="SQLite foreign keys can only be defined at CREATE TABLE time"'}>+ Add foreign key</button></div>
-    ${fk.foreign_keys.length ? `<div class="tw"><table><tr><th>Name</th><th>Columns</th><th>References</th><th>On delete</th><th>On update</th><th></th></tr>${fk.foreign_keys.map((f, n) => `<tr><td><b>${esc(f.name)}</b></td><td>${f.pairs.map(x => `<span class="chip">${esc(x.col)}</span>`).join(' ')}</td><td>${esc((f.ref_db && f.ref_db !== S.db ? f.ref_db + '.' : '') + f.ref_table)} (${f.pairs.map(x => esc(x.ref)).join(', ')})</td><td>${esc(f.on_delete)}</td><td>${esc(f.on_update)}</td><td class="act">${f.droppable ? `<button class="danger ghost" data-df="${n}">Drop</button>` : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No foreign keys</div>'}
+    ${fk.foreign_keys.length ? `<div class="tw"><table><tr><th>Name</th><th>Columns</th><th>References</th><th>On delete</th><th>On update</th><th></th></tr>${fk.foreign_keys.map((f, n) => `<tr><td><b>${esc(f.name)}</b></td><td>${f.pairs.map(x => `<span class="chip">${esc(x.col)}</span>`).join(' ')}</td><td>${esc((f.ref_db && f.ref_db !== S.db ? f.ref_db + '.' : '') + f.ref_table)} (${f.pairs.map(x => esc(x.ref)).join(', ')})</td><td>${esc(f.on_delete)}</td><td>${esc(f.on_update)}</td><td class="act">${f.droppable ? `<button class="danger ghost" data-df="${n}">Drop</button>` : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No foreign keys</div>'}` : ''}
+    <div class="bar" style="margin-top:22px"><h3 style="margin:0">Triggers</h3><span class="spacer"></span><button id="atr">+ Add trigger</button></div>
+    ${(tr.triggers || []).length ? `<div class="tw"><table><tr><th>Name</th><th>Timing</th><th>Event</th><th>Statement / Body</th><th></th></tr>${tr.triggers.map((t, n) => `<tr><td><b>${esc(t.name)}</b></td><td><span class="badge">${esc(t.timing)}</span></td><td><span class="lvl lvl-database">${esc(t.event)}</span></td><td><code style="font-size:12px">${esc(t.body)}</code></td><td class="act"><button class="danger ghost" data-dtr="${n}">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty">No triggers on this ' + (isView ? 'view' : 'table') + '</div>'}
     <h3>CREATE statement</h3><pre>${esc(r.create)}</pre>`;
+    if ($('#ev-btn')) $('#ev-btn').onclick = () => viewEditor({ name: S.table, select: r.view_select || r.create });
     C().querySelectorAll('[data-dc]:not([disabled])').forEach(b => b.onclick = () => confirmDo(`Drop column ${b.dataset.dc}? Its data will be lost.`, async () => { await api('drop_column', { db: S.db, table: S.table, column: b.dataset.dc }); render(); }));
     C().querySelectorAll('[data-ec]').forEach(b => b.onclick = () => columnEditor(r.columns, r.columns[b.dataset.ec]));
-    $('#ac').onclick = () => columnEditor(r.columns, null);
-    $('#ai').onclick = () => indexEditor(r.columns);
-    if (fk.supported) $('#af').onclick = () => fkEditor(r.columns);
+    if ($('#ac')) $('#ac').onclick = () => columnEditor(r.columns, null);
+    if ($('#ai')) $('#ai').onclick = () => indexEditor(r.columns);
+    if ($('#af') && fk.supported) $('#af').onclick = () => fkEditor(r.columns);
+    if ($('#atr')) $('#atr').onclick = () => triggerEditor(S.table, isView);
     C().querySelectorAll('[data-di]').forEach(b => b.onclick = () => { const i = ix.indexes[b.dataset.di]; confirmDo(`Drop ${i.type === 'PRIMARY' ? 'the primary key' : 'index ' + i.name}?`, async () => { await api('drop_index', { db: S.db, table: S.table, name: i.name }); toast('Index dropped'); render(); }); });
     C().querySelectorAll('[data-df]').forEach(b => b.onclick = () => { const f = fk.foreign_keys[b.dataset.df]; confirmDo(`Drop foreign key ${f.name}?`, async () => { await api('drop_fk', { db: S.db, table: S.table, name: f.name }); toast('Foreign key dropped'); render(); }); });
+    C().querySelectorAll('[data-dtr]').forEach(b => b.onclick = () => { const t = tr.triggers[b.dataset.dtr]; confirmDo(`Drop trigger ${t.name}?`, async () => { await api('drop_trigger', { db: S.db, name: t.name }); toast('Trigger dropped'); render(); }); });
+}
+
+function viewEditor(existing = null) {
+    const isEdit = !!existing;
+    const defName = existing?.name || '';
+    const defSel = existing?.select || (S.tables[S.db]?.[0] ? `SELECT * FROM ${S.driver === 'mysql' ? '`' + S.tables[S.db][0].name + '`' : '"' + S.tables[S.db][0].name + '"'}` : 'SELECT 1 AS id');
+    modal(`<div style="width:min(660px,85vw)"><h3>${isEdit ? '✎ Edit View ' + esc(defName) : '👁 New SQL View'}</h3>
+      <label>View Name<input name="name" value="${esc(defName)}" placeholder="v_active_users" required autofocus></label>
+      <label><span>SELECT Query (without <code>CREATE VIEW … AS</code> prefix)</span>
+        <textarea name="select" class="editor" style="height:140px" required>${esc(defSel)}</textarea>
+      </label>
+      <div class="sqlprev"><small>SQL preview</small><pre id="prev">…</pre></div></div>`, async f => {
+        const res = await api('save_view', { db: S.db, name: f.name, select: f.select, old_name: isEdit ? defName : '', replace: isEdit });
+        await loadTables(S.db);
+        if (S.table) S.table = res.name;
+        toast(isEdit ? 'View updated' : 'View created');
+        render();
+    });
+    const form = $('#modal form');
+    let t;
+    const preview = () => {
+        clearTimeout(t);
+        t = setTimeout(async () => {
+            try {
+                const res = await api('save_view', { db: S.db, name: form.name.value, select: form.select.value, old_name: isEdit ? defName : '', replace: isEdit, dry: true });
+                $('#prev').textContent = res.sql + ';';
+            } catch (e) { $('#prev').textContent = '-- ' + e.message; }
+        }, 150);
+    };
+    form.addEventListener('input', preview);
+    preview();
+}
+
+function triggerEditor(defaultTable = '', isView = false) {
+    const my = S.driver === 'mysql';
+    const tbls = S.tables[S.db] || [];
+    const timings = !my && isView ? ['INSTEAD OF'] : (my ? ['BEFORE', 'AFTER'] : ['BEFORE', 'AFTER', 'INSTEAD OF']);
+    modal(`<div style="width:min(660px,85vw)"><h3>⚡ New Trigger</h3>
+      <div class="ce-grid">
+        <label>Trigger Name<input name="name" placeholder="trg_${esc(defaultTable || 'table')}_after_insert" required autofocus></label>
+        <label>Target Table${!my ? ' / View' : ''}<select name="table">${tbls.map(t => `<option value="${esc(t.name)}" ${t.name === defaultTable ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>
+        <label>Timing<select name="timing">${timings.map(tm => `<option>${tm}</option>`).join('')}</select></label>
+        <label>Event<select name="event"><option>INSERT</option><option>UPDATE</option><option>DELETE</option></select></label>
+      </div>
+      <label><span>Trigger Body (executed <code>FOR EACH ROW</code> inside <code>BEGIN … END</code>; reference <code>NEW.col</code> / <code>OLD.col</code>)</span>
+        <textarea name="body" class="editor" style="height:120px" placeholder="SET NEW.updated_at = CURRENT_TIMESTAMP;" required></textarea>
+      </label>
+      <div class="sqlprev"><small>SQL preview</small><pre id="prev">…</pre></div></div>`, async f => {
+        await api('create_trigger', { db: S.db, ...f });
+        toast('Trigger created');
+        render();
+    });
+    const form = $('#modal form');
+    const body = () => ({ db: S.db, name: form.name.value, table: form.table.value, timing: form.timing.value, event: form.event.value, body: form.body.value });
+    let t;
+    const preview = () => {
+        clearTimeout(t);
+        t = setTimeout(async () => {
+            try { $('#prev').textContent = (await api('create_trigger', { ...body(), dry: true })).sql + ';'; }
+            catch (e) { $('#prev').textContent = '-- ' + e.message; }
+        }, 150);
+    };
+    form.addEventListener('input', preview); form.addEventListener('change', preview);
+    preview();
+}
+
+function routineEditor(existing = null) {
+    const r = existing || { type: 'PROCEDURE', name: '', params: '', returns: 'INT', deterministic: false, body: 'SELECT 1;' };
+    modal(`<div style="width:min(680px,85vw)"><h3>⚙ ${existing ? 'Edit ' + r.type + ' ' + esc(r.name) : 'New Stored Procedure / Function'}</h3>
+      <div class="ce-grid">
+        <label>Type<select name="type"><option value="PROCEDURE" ${r.type === 'PROCEDURE' ? 'selected' : ''}>PROCEDURE</option><option value="FUNCTION" ${r.type === 'FUNCTION' ? 'selected' : ''}>FUNCTION</option></select></label>
+        <label>Name<input name="name" value="${esc(r.name)}" placeholder="sp_recalc_totals" required autofocus></label>
+        <label>Parameters<input name="params" value="${esc(r.params || '')}" placeholder="IN user_id INT, OUT total DECIMAL(10,2)"></label>
+        <label id="rt-ret" ${r.type === 'FUNCTION' ? '' : 'hidden'}>Returns Type<input name="returns" value="${esc(r.returns || 'INT')}" placeholder="INT or VARCHAR(255)"></label>
+      </div>
+      <label class="pc"><input type="checkbox" name="deterministic" ${r.deterministic ? 'checked' : ''}><span>DETERMINISTIC</span><small>Always produces the same result for the same input parameters</small></label>
+      <label><span>Routine Body (wrapped in <code>BEGIN … END</code> automatically if omitted)</span>
+        <textarea name="body" class="editor" style="height:140px" required>${esc(r.body || '')}</textarea>
+      </label>
+      <div class="sqlprev"><small>SQL preview</small><pre id="prev">…</pre></div></div>`, async f => {
+        await api('create_routine', { db: S.db, ...f, deterministic: !!f.deterministic, replace: !!existing });
+        toast('Routine saved');
+        render();
+    });
+    const form = $('#modal form');
+    const sync = () => { $('#rt-ret').hidden = form.type.value !== 'FUNCTION'; };
+    const body = () => ({ db: S.db, type: form.type.value, name: form.name.value, params: form.params.value, returns: form.returns.value, deterministic: form.deterministic.checked, body: form.body.value });
+    let t;
+    const preview = () => {
+        sync();
+        clearTimeout(t);
+        t = setTimeout(async () => {
+            try { $('#prev').textContent = (await api('create_routine', { ...body(), dry: true })).sql + ';'; }
+            catch (e) { $('#prev').textContent = '-- ' + e.message; }
+        }, 150);
+    };
+    form.addEventListener('input', preview); form.addEventListener('change', preview);
+    preview();
+}
+
+async function dbObjectsView() {
+    const my = S.driver === 'mysql';
+    const [trRes, rtRes] = await Promise.all([
+        api('triggers', { db: S.db }).catch(() => ({ triggers: [] })),
+        my ? api('routines', { db: S.db }).catch(() => ({ routines: [], events: [] })) : Promise.resolve({ routines: [], events: [] }),
+    ]);
+    const views = (S.tables[S.db] || []).filter(t => t.type?.includes('VIEW') || t.type === 'view');
+    const trigs = trRes.triggers || [];
+    const routs = rtRes.routines || [];
+    const evts = rtRes.events || [];
+
+    C().innerHTML = `<div class="bar"><h3 style="margin:0">👁 Views (${views.length})</h3><span class="spacer"></span><button class="primary" id="do-nv">+ New View</button></div>
+      ${views.length ? `<div class="tw"><table><tr><th>View Name</th><th>Actions</th></tr>${views.map(v => `<tr><td><a href="#" data-vw="${esc(v.name)}" style="color:var(--accent)"><b>👁 ${esc(v.name)}</b></a></td><td class="act"><button class="ghost" data-evw="${esc(v.name)}">✎ Edit</button><button class="ghost danger" data-dvw="${esc(v.name)}">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty" style="padding:18px">No views in this database</div>'}
+
+      <div class="bar" style="margin-top:22px"><h3 style="margin:0">⚡ Triggers (${trigs.length})</h3><span class="spacer"></span><button class="primary" id="do-ntr">+ New Trigger</button></div>
+      ${trigs.length ? `<div class="tw"><table><tr><th>Trigger</th><th>Table</th><th>Timing</th><th>Event</th><th>Body</th><th></th></tr>${trigs.map((t, i) => `<tr><td><b>${esc(t.name)}</b></td><td><a href="#" data-ttb="${esc(t.table)}" class="crumb">${esc(t.table)}</a></td><td><span class="badge">${esc(t.timing)}</span></td><td><span class="lvl lvl-database">${esc(t.event)}</span></td><td><code style="font-size:12px">${esc(t.body)}</code></td><td class="act"><button class="ghost danger" data-dtr="${i}">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty" style="padding:18px">No triggers in this database</div>'}
+
+      ${my ? `<div class="bar" style="margin-top:22px"><h3 style="margin:0">⚙ Stored Procedures & Functions (${routs.length})</h3><span class="spacer"></span><button class="primary" id="do-nrt">+ New Routine</button></div>
+      ${routs.length ? `<div class="tw"><table><tr><th>Name</th><th>Type</th><th>Returns</th><th>Definition</th><th></th></tr>${routs.map((r, i) => `<tr><td><b>${esc(r.name)}</b></td><td><span class="lvl lvl-${r.type === 'FUNCTION' ? 'table' : 'database'}">${esc(r.type)}</span></td><td><code>${esc(r.returns || '–')}</code></td><td><code style="font-size:12px">${esc(r.body || r.sql)}</code></td><td class="act"><button class="ghost" data-rrun="${i}">▶ Call</button><button class="ghost danger" data-drt="${i}">Drop</button></td></tr>`).join('')}</table></div>` : '<div class="empty" style="padding:18px">No stored procedures or functions in this database</div>'}
+
+      ${evts.length ? `<div class="bar" style="margin-top:22px"><h3 style="margin:0">⏱ Scheduled Events (${evts.length})</h3></div>
+      <div class="tw"><table><tr><th>Event</th><th>Type</th><th>Schedule</th><th>Status</th><th>Definition</th></tr>${evts.map(e => `<tr><td><b>${esc(e.name)}</b></td><td>${esc(e.type)}</td><td>${esc(e.execute_at || ('EVERY ' + (e.interval_val || '') + ' ' + (e.interval_field || '')))}</td><td><span class="badge">${esc(e.status)}</span></td><td><code style="font-size:12px">${esc(e.body)}</code></td></tr>`).join('')}</table></div>` : ''}` : ''}`;
+
+    $('#do-nv').onclick = () => viewEditor();
+    $('#do-ntr').onclick = () => triggerEditor(S.tables[S.db]?.[0]?.name || '');
+    if ($('#do-nrt')) $('#do-nrt').onclick = () => routineEditor();
+    C().querySelectorAll('[data-vw]').forEach(a => a.onclick = e => { e.preventDefault(); S.table = a.dataset.vw; S.tab = 'browse'; render(); });
+    C().querySelectorAll('[data-ttb]').forEach(a => a.onclick = e => { e.preventDefault(); S.table = a.dataset.ttb; S.tab = 'structure'; render(); });
+    C().querySelectorAll('[data-evw]').forEach(b => b.onclick = guard(async () => {
+        const st = await api('structure', { db: S.db, table: b.dataset.evw });
+        viewEditor({ name: b.dataset.evw, select: st.view_select || st.create });
+    }));
+    C().querySelectorAll('[data-dvw]').forEach(b => b.onclick = () => confirmDo(`Drop view ${b.dataset.dvw}?`, async () => { await api('drop_table', { db: S.db, table: b.dataset.dvw }); await loadTables(S.db); render(); }));
+    C().querySelectorAll('[data-dtr]').forEach(b => b.onclick = () => { const t = trigs[b.dataset.dtr]; confirmDo(`Drop trigger ${t.name}?`, async () => { await api('drop_trigger', { db: S.db, name: t.name }); toast('Trigger dropped'); render(); }); });
+    C().querySelectorAll('[data-drt]').forEach(b => b.onclick = () => { const r = routs[b.dataset.drt]; confirmDo(`Drop ${r.type} ${r.name}?`, async () => { await api('drop_routine', { db: S.db, type: r.type, name: r.name }); toast('Routine dropped'); render(); }); });
+    C().querySelectorAll('[data-rrun]').forEach(b => b.onclick = () => {
+        const r = routs[b.dataset.rrun];
+        S.sql = r.type === 'FUNCTION' ? `SELECT \`${r.name}\`();` : `CALL \`${r.name}\`();`;
+        S.tab = 'sql';
+        render();
+    });
 }
 
 /* Reusable repeating-row list: rows built by rowHtml(i), "+" adds, "✕" removes. */
@@ -1335,10 +1490,11 @@ async function exportView() {
         ${t.length ? t.map(x => `<label style="flex-direction:row;gap:8px;color:var(--text)"><input type="checkbox" name="t" value="${esc(x.name)}" ${!S.table || S.table === x.name ? 'checked' : ''}><span>${esc(x.name)}</span><small style="color:var(--mute);margin-left:auto">${x.type?.includes('VIEW') || x.type === 'view' ? 'VIEW' : (x.rows ?? 0) + ' rows'}</small></label>`).join('') : '<div class="empty" style="padding:12px">No tables in this database</div>'}
       </div>
       <div class="bar" style="margin-top:8px;margin-bottom:0">
-        <label class="pc" style="flex:1"><input type="checkbox" name="structure" checked><span>Structure</span><small>CREATE TABLE / VIEW statements</small></label>
+        <label class="pc" style="flex:1"><input type="checkbox" name="structure" checked><span>Structure</span><small>Tables, views & triggers</small></label>
         <label class="pc" style="flex:1"><input type="checkbox" name="data" checked><span>Data</span><small>Batched multi-row INSERTs</small></label>
       </div>
-      ${my ? `<label class="pc" style="margin-top:6px"><input type="checkbox" name="create_db" ${!S.table ? 'checked' : ''}><span>Include <code>CREATE DATABASE IF NOT EXISTS</code> & <code>USE</code></span><small>Recommended when exporting an entire database for backup or migration</small></label>` : ''}
+      ${my ? `<label class="pc" style="margin-top:6px"><input type="checkbox" name="routines" ${!S.table ? 'checked' : ''}><span>Include Stored Procedures & Functions</span><small>Export CREATE PROCEDURE / FUNCTION definitions</small></label>
+      <label class="pc" style="margin-top:6px"><input type="checkbox" name="create_db" ${!S.table ? 'checked' : ''}><span>Include <code>CREATE DATABASE IF NOT EXISTS</code> & <code>USE</code></span><small>Recommended when exporting an entire database for backup or migration</small></label>` : ''}
     </div>
     <div id="csvopts" hidden><label>Table<select name="ct">${t.map(x => `<option ${S.table === x.name ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
       <div class="ce-grid"><label>Delimiter<select name="delim">${Object.entries(DELIMS).map(([k, v]) => `<option value="${k === '\t' ? 'tab' : k}">${v}</option>`).join('')}</select></label><label>NULL written as<input name="null_as" placeholder="(empty)"></label></div>
@@ -1362,7 +1518,7 @@ async function exportView() {
         if (f.fmt.value === 'csv') return exportCSV({ db: dbUse, table: f.ct.value, delimiter: f.delim.value === 'tab' ? '\t' : f.delim.value, null_as: f.null_as.value, header: f.header.checked, bom: f.bom.checked, compress: comp });
         const picked = d.getAll('t');
         if (!picked.length) throw new Error('Select at least one table to export');
-        return exportSQL({ db: dbUse, table: picked.length === 1 ? picked[0] : null, tables: picked, structure: !!d.get('structure'), data: !!d.get('data'), create_db: !!d.get('create_db'), compress: comp });
+        return exportSQL({ db: dbUse, table: picked.length === 1 ? picked[0] : null, tables: picked, structure: !!d.get('structure'), data: !!d.get('data'), routines: !!d.get('routines'), create_db: !!d.get('create_db'), compress: comp });
     });
 }
 function compExt(comp) { return comp === 'gzip' ? '.gz' : comp === 'zip' ? '.zip' : ''; }

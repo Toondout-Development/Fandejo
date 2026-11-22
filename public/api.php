@@ -1306,8 +1306,13 @@ try {
         out(['tables' => $r]);
 
     case 'structure':
+        $isView = false;
+        $viewSelect = '';
         if ($drv === 'sqlite') {
-            $create = (string)$p->query("SELECT sql FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn();
+            $meta = rows($p, 'SELECT type, sql FROM sqlite_master WHERE name=?', [(string)$tb])[0] ?? [];
+            $isView = strtolower((string)($meta['type'] ?? '')) === 'view';
+            $create = (string)($meta['sql'] ?? '');
+            if ($isView && preg_match('/\bAS\s+(.+)$/is', $create, $vm)) $viewSelect = trim($vm[1]);
             $hasAi = stripos($create, 'AUTOINCREMENT') !== false;
             $cols = array_map(function ($x) use ($hasAi) {
                 $pt = parse_coltype($x['type']);
@@ -1327,7 +1332,7 @@ try {
                     'comment' => '',
                 ];
             }, rows($p, 'PRAGMA table_info(' . q($tb, $drv) . ')'));
-            $idx = rows($p, 'PRAGMA index_list(' . q($tb, $drv) . ')');
+            $idx = $isView ? [] : rows($p, 'PRAGMA index_list(' . q($tb, $drv) . ')');
         } else {
             $maria = stripos((string)$p->query('SELECT VERSION()')->fetchColumn(), 'mariadb') !== false;
             $cols = array_map(function ($x) use ($maria, $drv) {
@@ -1336,10 +1341,153 @@ try {
                     'parsed' => $pt, 'def' => parse_default($x['Default'], $x['Null'] === 'YES', $x['Extra'], $maria, $drv),
                     'ai' => stripos($x['Extra'], 'auto_increment') !== false, 'on_update' => stripos($x['Extra'], 'on update') !== false, 'collation' => $x['Collation'] ?? null, 'comment' => $x['Comment'] ?? ''];
             }, rows($p, "SHOW FULL COLUMNS FROM $T"));
-            $idx = rows($p, "SHOW INDEX FROM $T");
-            $create = rows($p, "SHOW CREATE TABLE $T")[0]['Create Table'] ?? '';
+            $rowC = rows($p, "SHOW CREATE TABLE $T")[0] ?? [];
+            if (isset($rowC['Create View'])) {
+                $isView = true;
+                $create = (string)$rowC['Create View'];
+                $vDef = (string)(rows($p, 'SELECT VIEW_DEFINITION d FROM information_schema.VIEWS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?', [$db, $tb])[0]['d'] ?? '');
+                if ($vDef !== '') $viewSelect = $vDef;
+                elseif (preg_match('/\bAS\s+(.+)$/is', $create, $vm)) $viewSelect = trim($vm[1]);
+                $idx = [];
+            } else {
+                $create = (string)($rowC['Create Table'] ?? '');
+                $idx = rows($p, "SHOW INDEX FROM $T");
+            }
         }
-        out(['columns' => $cols, 'indexes' => $idx, 'create' => $create]);
+        out(['columns' => $cols, 'indexes' => $idx, 'create' => $create, 'is_view' => $isView, 'view_select' => $viewSelect]);
+
+    case 'save_view':
+        $vname = trim((string)($in['name'] ?? $tb ?? ''));
+        $vsel = trim(rtrim(trim((string)($in['select'] ?? '')), ';'));
+        if ($vname === '' || $vsel === '') fail('View name and SELECT query are required');
+        if (!preg_match('/^\s*(SELECT|WITH)\b/i', $vsel)) fail('View definition must start with SELECT or WITH');
+        $VT = ($drv === 'mysql' ? q((string)$db, $drv) . '.' : '') . q($vname, $drv);
+        $oldName = trim((string)($in['old_name'] ?? ''));
+        if ($drv === 'mysql') {
+            $sql = "CREATE OR REPLACE VIEW $VT AS $vsel";
+            if (empty($in['dry'])) {
+                $p->exec($sql);
+                if ($oldName !== '' && $oldName !== $vname) {
+                    $p->exec('DROP VIEW IF EXISTS ' . q((string)$db, 'mysql') . '.' . q($oldName, 'mysql'));
+                }
+            }
+        } else {
+            $dropTarget = $oldName !== '' ? $oldName : $vname;
+            $sql = 'DROP VIEW IF EXISTS ' . q($dropTarget, 'sqlite') . ";\nCREATE VIEW $VT AS $vsel";
+            if (empty($in['dry'])) {
+                $p->beginTransaction();
+                try {
+                    if (!empty($in['replace']) || $oldName !== '') {
+                        $p->exec('DROP VIEW IF EXISTS ' . q($dropTarget, 'sqlite'));
+                    }
+                    $p->exec("CREATE VIEW $VT AS $vsel");
+                    $p->commit();
+                } catch (Throwable $e) {
+                    if ($p->inTransaction()) $p->rollBack();
+                    throw $e;
+                }
+            }
+        }
+        out(['ok' => true, 'name' => $vname, 'sql' => $sql]);
+
+    case 'triggers':
+        $trigs = [];
+        if ($drv === 'mysql') {
+            $sql = 'SELECT TRIGGER_NAME name, EVENT_MANIPULATION event, ACTION_TIMING timing, EVENT_OBJECT_TABLE `table`, ACTION_STATEMENT body
+                    FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?' . ($tb ? ' AND EVENT_OBJECT_TABLE = ?' : '') . ' ORDER BY TRIGGER_NAME';
+            $trigs = rows($p, $sql, $tb ? [$db, $tb] : [$db]);
+            foreach ($trigs as &$tr) {
+                $qt = q((string)$db, 'mysql') . '.' . q($tr['name'], 'mysql');
+                $tr['sql'] = rows($p, "SHOW CREATE TRIGGER $qt")[0]['SQL Original Statement'] ?? "CREATE TRIGGER {$tr['name']} {$tr['timing']} {$tr['event']} ON {$tr['table']} FOR EACH ROW {$tr['body']}";
+            }
+        } else {
+            $sql = "SELECT name, tbl_name `table`, sql FROM sqlite_master WHERE type='trigger'" . ($tb ? ' AND tbl_name = ?' : '') . ' ORDER BY name';
+            foreach (rows($p, $sql, $tb ? [$tb] : []) as $tr) {
+                $timing = ''; $event = ''; $body = $tr['sql'] ?? '';
+                if (preg_match('/\b(BEFORE|AFTER|INSTEAD\s+OF)\s+(INSERT|UPDATE(?:\s+OF\s+[^\s]+)?|DELETE)\b/i', $body, $m)) {
+                    $timing = strtoupper((string)preg_replace('/\s+/', ' ', $m[1]));
+                    $event = strtoupper((string)preg_replace('/\s+/', ' ', $m[2]));
+                }
+                if (preg_match('/\bBEGIN\b(.*)\bEND\s*;?\s*$/is', $body, $bm)) {
+                    $body = trim($bm[1]);
+                }
+                $trigs[] = ['name' => $tr['name'], 'table' => $tr['table'], 'timing' => $timing, 'event' => $event, 'body' => $body, 'sql' => $tr['sql']];
+            }
+        }
+        out(['triggers' => $trigs]);
+
+    case 'create_trigger':
+        $tname = trim((string)($in['name'] ?? ''));
+        $ttable = trim((string)($in['table'] ?? $tb ?? ''));
+        $timing = strtoupper(trim((string)($in['timing'] ?? 'BEFORE')));
+        $event = strtoupper(trim((string)($in['event'] ?? 'INSERT')));
+        $tbody = trim((string)($in['body'] ?? ''));
+        if ($tname === '' || $ttable === '' || $tbody === '') fail('Trigger name, table, and SQL body are required');
+        $allowedTimings = $drv === 'sqlite' ? ['BEFORE', 'AFTER', 'INSTEAD OF'] : ['BEFORE', 'AFTER'];
+        if (!in_array($timing, $allowedTimings, true)) fail('Invalid trigger timing');
+        if (!in_array($event, ['INSERT', 'UPDATE', 'DELETE'], true)) fail('Invalid trigger event');
+        $QTN = ($drv === 'mysql' ? q((string)$db, 'mysql') . '.' : '') . q($tname, $drv);
+        $QTB = ($drv === 'mysql' ? q((string)$db, 'mysql') . '.' : '') . q($ttable, $drv);
+        if (!str_ends_with(rtrim($tbody), ';')) $tbody .= ';';
+        $sql = "CREATE TRIGGER $QTN $timing $event ON $QTB FOR EACH ROW\nBEGIN\n  $tbody\nEND";
+        if (empty($in['dry'])) $p->exec($sql);
+        out(['ok' => true, 'sql' => $sql]);
+
+    case 'drop_trigger':
+        $tname = trim((string)($in['name'] ?? ''));
+        if ($tname === '') fail('Trigger name required');
+        $QTN = ($drv === 'mysql' ? q((string)$db, 'mysql') . '.' : '') . q($tname, $drv);
+        $p->exec("DROP TRIGGER IF EXISTS $QTN");
+        out(['ok' => true]);
+
+    case 'routines':
+        if ($drv !== 'mysql') out(['routines' => [], 'events' => [], 'supported' => false]);
+        $routs = rows($p, 'SELECT ROUTINE_NAME name, ROUTINE_TYPE type, DTD_IDENTIFIER returns,ROUTINE_DEFINITION body, CREATED created, LAST_ALTERED altered
+                           FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME', [$db]);
+        foreach ($routs as &$rt) {
+            $qr = q((string)$db, 'mysql') . '.' . q($rt['name'], 'mysql');
+            $type = strtoupper($rt['type']) === 'FUNCTION' ? 'FUNCTION' : 'PROCEDURE';
+            try {
+                $rowR = rows($p, "SHOW CREATE $type $qr")[0] ?? [];
+                $rt['sql'] = $rowR["Create " . ucfirst(strtolower($type))] ?? '';
+            } catch (Throwable) { $rt['sql'] = ''; }
+        }
+        $evts = [];
+        try {
+            $evts = rows($p, 'SELECT EVENT_NAME name, EVENT_TYPE type, EXECUTE_AT execute_at, INTERVAL_VALUE interval_val, INTERVAL_FIELD interval_field, STATUS status, EVENT_DEFINITION body
+                              FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME', [$db]);
+        } catch (Throwable) {}
+        out(['routines' => $routs, 'events' => $evts, 'supported' => true]);
+
+    case 'create_routine':
+        if ($drv !== 'mysql') fail('Stored routines are supported on MySQL/MariaDB only');
+        $rtype = strtoupper(trim((string)($in['type'] ?? 'PROCEDURE'))) === 'FUNCTION' ? 'FUNCTION' : 'PROCEDURE';
+        $rname = trim((string)($in['name'] ?? ''));
+        $rparams = trim((string)($in['params'] ?? ''));
+        $rret = trim((string)($in['returns'] ?? 'INT'));
+        $det = !empty($in['deterministic']) ? ' DETERMINISTIC' : '';
+        $rbody = trim((string)($in['body'] ?? ''));
+        if ($rname === '' || $rbody === '') fail('Routine name and body are required');
+        if ($rtype === 'FUNCTION' && !preg_match('/^[A-Za-z0-9_(),\s]+$/', $rret)) fail('Invalid return type');
+        $QR = q((string)$db, 'mysql') . '.' . q($rname, 'mysql');
+        if (!preg_match('/^\s*BEGIN\b/i', $rbody)) {
+            if (!str_ends_with(rtrim($rbody), ';')) $rbody .= ';';
+            $rbody = "BEGIN\n  $rbody\nEND";
+        }
+        $sql = "CREATE $rtype $QR($rparams)" . ($rtype === 'FUNCTION' ? " RETURNS $rret$det" : $det) . "\n$rbody";
+        if (empty($in['dry'])) {
+            if (!empty($in['replace'])) $p->exec("DROP $rtype IF EXISTS $QR");
+            $p->exec($sql);
+        }
+        out(['ok' => true, 'sql' => $sql]);
+
+    case 'drop_routine':
+        if ($drv !== 'mysql') fail('MySQL/MariaDB only');
+        $rtype = strtoupper(trim((string)($in['type'] ?? 'PROCEDURE'))) === 'FUNCTION' ? 'FUNCTION' : 'PROCEDURE';
+        $rname = trim((string)($in['name'] ?? ''));
+        if ($rname === '') fail('Routine name required');
+        $p->exec("DROP $rtype IF EXISTS " . q((string)$db, 'mysql') . '.' . q($rname, 'mysql'));
+        out(['ok' => true]);
 
     case 'browse':
         $page = max(1, (int)($in['page'] ?? 1)); $per = min(500, max(5, (int)($in['per'] ?? 50)));
@@ -1946,6 +2094,37 @@ try {
             }
         }
         foreach ($viewsQueue as $vSql) $emit($vSql);
+
+        if ($wantStruct) {
+            if ($drv === 'sqlite') {
+                $tPlace = $tables ? ' AND tbl_name IN (' . implode(',', array_map(fn($t) => $p->quote((string)$t), $tables)) . ')' : '';
+                foreach (rows($p, "SELECT name, sql FROM sqlite_master WHERE type='trigger'$tPlace ORDER BY name") as $tr) {
+                    if (!empty($tr['sql'])) {
+                        $emit("-- Trigger: {$tr['name']}\nDROP TRIGGER IF EXISTS " . q($tr['name'], 'sqlite') . ";\n{$tr['sql']};\n\n");
+                    }
+                }
+            } else {
+                $tPlace = $tables ? ' AND EVENT_OBJECT_TABLE IN (' . implode(',', array_map(fn($t) => $p->quote((string)$t), $tables)) . ')' : '';
+                foreach (rows($p, "SELECT TRIGGER_NAME name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?$tPlace ORDER BY TRIGGER_NAME", [$db]) as $tr) {
+                    $qt = q((string)$db, 'mysql') . '.' . q($tr['name'], 'mysql');
+                    $csql = rows($p, "SHOW CREATE TRIGGER $qt")[0]['SQL Original Statement'] ?? '';
+                    if ($csql !== '') {
+                        $emit("-- Trigger: {$tr['name']}\nDROP TRIGGER IF EXISTS $qt;\n$csql;\n\n");
+                    }
+                }
+                if (!empty($in['routines'])) {
+                    foreach (rows($p, 'SELECT ROUTINE_NAME name, ROUTINE_TYPE type FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME', [$db]) as $rt) {
+                        $type = strtoupper($rt['type']) === 'FUNCTION' ? 'FUNCTION' : 'PROCEDURE';
+                        $qr = q((string)$db, 'mysql') . '.' . q($rt['name'], 'mysql');
+                        $rowR = rows($p, "SHOW CREATE $type $qr")[0] ?? [];
+                        $rsql = $rowR['Create ' . ucfirst(strtolower($type))] ?? '';
+                        if ($rsql !== '') {
+                            $emit("-- $type: {$rt['name']}\nDROP $type IF EXISTS $qr;\n$rsql;\n\n");
+                        }
+                    }
+                }
+            }
+        }
         $emit($drv === 'mysql' ? "SET FOREIGN_KEY_CHECKS=1;\n" : "PRAGMA foreign_keys=ON;\n");
 
         if ($stream) {
