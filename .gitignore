@@ -1,5 +1,6 @@
 # Local configuration & SQLite data directory
 /config.php
+/.fandejo_locks.json
 /data/
 /HANDOFF.md
 

@@ -158,7 +158,7 @@ function layout() {
       <button class="ghost" id="theme" title="Toggle Dark / Light theme">◐</button><button class="ghost" id="out" title="Sign out">⏻</button></span></div>
       <input class="search" id="flt" placeholder="Filter…" value="${esc(S.filter)}"><div class="tree" id="tree"></div>
       <div style="padding:10px"><button id="newdb" style="width:100%">+ New database</button></div></aside>
-      <main><div class="top"><div class="crumbs" id="crumbs"></div><button id="ghome">⌂ Home</button>${S.driver === 'mysql' ? '<button id="gusers">Users</button>' : ''}<button id="gsql">SQL</button></div><div id="tabs" class="tabs"></div><div class="content" id="content"></div></main></div>`;
+      <main><div class="top"><div class="crumbs" id="crumbs"></div><button id="ghome">⌂ Home</button><button id="gusers">Users</button><button id="gsql">SQL</button></div><div id="tabs" class="tabs"></div><div class="content" id="content"></div></main></div>`;
     $('#theme').onclick = () => { const r = document.documentElement; r.dataset.theme = r.dataset.theme === 'light' ? '' : 'light'; localStorage.theme = r.dataset.theme; };
     $('#out').onclick = async () => { await api('logout'); location.reload(); };
     $('#flt').oninput = e => { S.filter = e.target.value; tree(); $('#flt').focus(); };
@@ -192,7 +192,7 @@ function render() {
     if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
         : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
-            : [['home', 'Dashboard'], ...(S.driver === 'mysql' ? [['users', 'Users']] : []), ['sql', 'SQL']];
+            : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
     $('#tabs').querySelectorAll('.tab').forEach(t => t.onclick = () => { S.tab = t.dataset.k; render(); });
@@ -1103,36 +1103,124 @@ const scopeLevel = s => s.db === '*' ? 'Global' : s.table === '*' ? 'Database' :
 const acctKey = u => `${u.user}@${u.host}`;
 
 async function users() {
-    if (S.driver !== 'mysql') { C().innerHTML = '<div class="empty">User management is available for MySQL/MariaDB only.</div>'; return; }
+    const my = S.driver === 'mysql';
     const r = await api('users');
     const sel = r.users.find(u => acctKey(u) === S.acct) || r.users[0];
     S.acct = sel ? acctKey(sel) : null;
     const risk = u => u.scopes.some(s => s.db === '*' && s.all) ? 'admin' : u.scopes.some(s => s.db === '*' && s.privs.length) ? 'global' : '';
     const q = (S.userFilter || '').toLowerCase();
-    C().innerHTML = `<div class="acct-layout"><div class="acct-list"><div class="bar"><input id="uf" placeholder="Find account…" value="${esc(S.userFilter || '')}" style="flex:1"><button class="primary" id="nu">+ New</button></div>
-      ${r.users.filter(u => !q || acctKey(u).toLowerCase().includes(q)).map(u => `<div class="acct ${acctKey(u) === S.acct ? 'active' : ''}" data-k="${esc(acctKey(u))}"><div class="avatar">${esc((u.user || '?')[0].toUpperCase())}</div><div style="min-width:0"><div class="nm">${esc(u.user || '(anonymous)')}</div><small>@${esc(u.host)}</small></div>${risk(u) === 'admin' ? '<span class="badge warn">admin</span>' : ''}</div>`).join('')}</div>
+
+    const acctSlots = [];
+    for (const a of Object.values(r.lockouts?.accounts || {})) {
+        const ipEntries = Object.values(a.by_ip || {});
+        if (ipEntries.length) {
+            for (const slot of ipEntries) {
+                if (slot.locked || slot.attempts > 0) acctSlots.push({ driver: a.driver, user: a.user, ...slot });
+            }
+        } else if (a.locked || a.attempts > 0) {
+            acctSlots.push({ driver: a.driver, user: a.user, ip: a.last_ip || '–', attempts: a.attempts, locked: a.locked, last_failed: a.last_failed });
+        }
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const lockedIps = Object.values(r.lockouts?.ips || {}).filter(x => x.locked_until && x.locked_until > nowSec);
+    const hasLocks = r.is_admin && (acctSlots.length > 0 || lockedIps.length > 0);
+    const adminCoolMin = Math.round((r.admin_lockout_seconds || 900) / 60);
+
+    const lockBanner = hasLocks ? `<div class="dash-card" style="margin-bottom:16px;border-color:var(--danger)">
+      <div class="bar" style="margin-bottom:8px">
+        <h3 style="margin:0;color:var(--danger)">🔒 Security Lockouts & Failed Login Tracker</h3>
+        <span class="badge warn">${acctSlots.filter(a => a.locked).length} locked (account+IP) · ${acctSlots.length} tracked · ${lockedIps.length} IP cooldown(s)</span>
+        <span class="spacer"></span>
+        <button id="ul-all" class="primary">🔓 Clear All Lockouts</button>
+      </div>
+      <small style="color:var(--mute);display:block;margin-bottom:8px">Lockouts are isolated per <b>(Account + Client IP)</b> so an external attacker cannot lock out an administrator on another IP. Full-privilege admins also self-recover after a ${adminCoolMin}m cooldown or via CLI: <code>php public/api.php --unlock</code>.</small>
+      <div class="tw"><table>
+        <tr><th>Account</th><th>Engine</th><th>Source IP</th><th>Status</th><th>Failed Attempts</th><th>Last Attempt</th><th></th></tr>
+        ${acctSlots.map(a => `<tr>
+          <td><b>${esc(a.user)}</b></td>
+          <td><span class="badge">${esc(a.driver)}</span></td>
+          <td><code>${esc(a.ip || '–')}</code></td>
+          <td>${a.locked ? '<span class="lvl lvl-global">LOCKED (IP)</span>' : '<span class="badge warn">Warning</span>'}</td>
+          <td>${a.attempts} / ${r.max_login_attempts || 5}</td>
+          <td>${a.last_failed ? new Date(a.last_failed * 1000).toLocaleString() : '–'}</td>
+          <td class="act"><button data-ul-u="${esc(a.user)}" data-ul-d="${esc(a.driver)}" data-ul-ip="${esc(a.ip || '')}" class="primary">${a.locked ? '🔓 Unlock IP' : 'Reset'}</button></td>
+        </tr>`).join('')}
+        ${lockedIps.map(ip => `<tr>
+          <td><b>All Accounts</b></td>
+          <td><span class="badge">IP Cooldown</span></td>
+          <td><code>${esc(ip.ip)}</code></td>
+          <td><span class="lvl lvl-global">RATE LIMITED</span></td>
+          <td>${ip.attempts} (last: <code>${esc(ip.last_user || '–')}</code>)</td>
+          <td>Until ${new Date(ip.locked_until * 1000).toLocaleTimeString()}</td>
+          <td class="act"><button data-ul-only-ip="${esc(ip.ip)}" class="primary">🔓 Unblock IP</button></td>
+        </tr>`).join('')}
+      </table></div>
+    </div>` : '';
+
+    C().innerHTML = `${lockBanner}<div class="acct-layout"><div class="acct-list"><div class="bar"><input id="uf" placeholder="Find account…" value="${esc(S.userFilter || '')}" style="flex:1"><button class="primary" id="nu">+ New</button></div>
+      ${r.users.filter(u => !q || acctKey(u).toLowerCase().includes(q)).map(u => {
+          const isLocked = u.fandejo_locked || u.db_locked;
+          return `<div class="acct ${acctKey(u) === S.acct ? 'active' : ''}" data-k="${esc(acctKey(u))}"><div class="avatar">${esc((u.user || '?')[0].toUpperCase())}</div><div style="min-width:0"><div class="nm">${esc(u.user || '(anonymous)')}</div><small>@${esc(u.host)}</small></div>${isLocked ? '<span class="lvl lvl-global" style="margin-left:auto" title="Account has an active lockout">🔒 locked</span>' : (risk(u) === 'admin' ? '<span class="badge warn">admin</span>' : (u.failed_attempts ? `<span class="badge warn" title="${u.failed_attempts} failed sign-in attempt(s)">${u.failed_attempts} fail</span>` : ''))}</div>`;
+      }).join('')}</div>
       <div class="acct-detail" id="ad"></div></div>`;
     $('#uf').oninput = e => { S.userFilter = e.target.value; users(); setTimeout(() => { const i = $('#uf'); i.focus(); i.setSelectionRange(99, 99); }); };
     C().querySelectorAll('.acct').forEach(el => el.onclick = () => { S.acct = el.dataset.k; users(); });
-    $('#nu').onclick = () => modal(`<h3>New account</h3><label>Username<input name="user" required autofocus></label><label>Host<input name="host" value="localhost"><small>Use % for any host</small></label><label>Password<input name="pass" type="password" required></label><label>Grant all on database (optional)<select name="grant_db"><option value="">–</option>${S.dbs.map(d => `<option>${esc(d.name)}</option>`).join('')}</select></label>`, async v => { await api('create_user', v); S.acct = `${v.user}@${v.host}`; toast('Account created'); users(); });
-    if (sel) await accountDetail(sel, r.me);
+    if ($('#ul-all')) $('#ul-all').onclick = () => confirmDo('Clear all Fandejo login lockouts and IP rate-limit counters?', async () => { await api('unlock_account', { clear_all: true }); toast('All lockouts cleared'); users(); });
+    C().querySelectorAll('[data-ul-u]').forEach(b => b.onclick = guard(async () => {
+        await api('unlock_account', { user: b.dataset.ulU, driver: b.dataset.ulD, ip: b.dataset.ulIp });
+        toast(`Unlocked ${b.dataset.ulU} (${b.dataset.ulIp})`); users();
+    }));
+    C().querySelectorAll('[data-ul-only-ip]').forEach(b => b.onclick = guard(async () => {
+        await api('unlock_account', { ip: b.dataset.ulOnlyIp });
+        toast(`Unblocked IP ${b.dataset.ulOnlyIp}`); users();
+    }));
+    $('#nu').onclick = () => modal(`<h3>New ${my ? 'database' : 'SQLite administrator'} account</h3><label>Username<input name="user" required autofocus></label>${my ? `<label>Host<input name="host" value="localhost"><small>Use % for any host</small></label>` : ''}<label>Password<input name="pass" type="password" placeholder="${my ? '' : 'Min 6 characters'}" required></label>${my ? `<label>Grant all on database (optional)<select name="grant_db"><option value="">–</option>${S.dbs.map(d => `<option>${esc(d.name)}</option>`).join('')}</select></label>` : '<small style="color:var(--mute)">Stored in <code>config.php</code> with an Argon2id password hash.</small>'}`, async v => { await api('create_user', v); S.acct = `${v.user}@${my ? v.host : 'sqlite-sandbox'}`; toast('Account created'); users(); });
+    if (sel) await accountDetail(sel, r.me, r.is_admin, r.max_login_attempts || 5);
     else $('#ad').innerHTML = '<div class="empty">No accounts</div>';
 }
 
-async function accountDetail(u, me) {
-    const g = await api('user_grants', { user: u.user, host: u.host });
+async function accountDetail(u, me, isAdmin = true, maxAttempts = 5) {
+    const my = S.driver === 'mysql';
+    const g = my ? await api('user_grants', { user: u.user, host: u.host }) : { scopes: u.scopes || [], catalog: {} };
     const isMe = u.user === me;
-    $('#ad').innerHTML = `<div class="acct-head"><div class="avatar big">${esc((u.user || '?')[0].toUpperCase())}</div><div style="flex:1"><h2 style="margin:0">${esc(u.user || '(anonymous)')}<span style="color:var(--mute)">@${esc(u.host)}</span></h2><small>${isMe ? 'This is the account you are signed in with' : `${g.scopes.length} privilege scope${g.scopes.length === 1 ? '' : 's'}`}</small></div>
+    const isLocked = u.fandejo_locked || u.db_locked;
+    const lockedIpsList = (u.by_ip || []).filter(s => s.locked).map(s => s.ip);
+
+    const lockAlert = (u.fandejo_locked || u.db_locked || u.failed_attempts > 0) ? `<div class="msg ${isLocked ? 'err' : ''}" style="display:flex;align-items:center;gap:10px;margin-top:14px">
+      <div style="flex:1">
+        ${u.fandejo_locked ? `<b>🔒 Per-IP Hard Lockout Active:</b> Locked for IP${lockedIpsList.length > 1 ? 's' : ''} <code>${esc(lockedIpsList.join(', ') || u.last_ip || 'unknown')}</code> (${u.failed_attempts} total failed attempts). ` : ''}
+        ${u.db_locked ? `<b>🔒 Database Engine Lock:</b> This MySQL/MariaDB user has <code>ACCOUNT LOCK</code> enabled on the server. ` : ''}
+        ${!isLocked && u.failed_attempts ? `<b>⚠ Failed Sign-in Attempts:</b> ${u.failed_attempts} failed attempt(s) tracked (last IP: <code>${esc(u.last_ip || '–')}</code>; locks at ${maxAttempts} per IP).` : ''}
+      </div>
+      ${isAdmin ? `<button id="u-unlock" class="primary">${isLocked ? '🔓 Unlock All IPs' : 'Reset Counter'}</button>` : ''}
+    </div>` : '';
+
+    $('#ad').innerHTML = `<div class="acct-head"><div class="avatar big">${esc((u.user || '?')[0].toUpperCase())}</div><div style="flex:1"><h2 style="margin:0">${esc(u.user || '(anonymous)')}<span style="color:var(--mute)">@${esc(u.host)}</span></h2><small>${isMe ? 'This is the account you are signed in with' : (my ? `${g.scopes.length} privilege scope${g.scopes.length === 1 ? '' : 's'}` : 'SQLite Sandbox Administrator (config.php)')}</small></div>
+      ${my && isAdmin && !u.db_locked ? `<button id="dblock" class="ghost danger" title="Lock account at the MySQL/MariaDB server level (ALTER USER … ACCOUNT LOCK)">🔒 Server Lock</button>` : ''}
       <button id="pw">Change password</button><button id="du" class="danger">Drop</button></div>
-      <div class="bar" style="margin-top:20px"><h3 style="margin:0">Privileges</h3><span class="spacer"></span><button class="primary" id="ap">+ Add privileges</button></div>
+      ${lockAlert}
+      ${my ? `<div class="bar" style="margin-top:20px"><h3 style="margin:0">Privileges</h3><span class="spacer"></span><button class="primary" id="ap">+ Add privileges</button></div>
       ${g.scopes.length ? g.scopes.map((s, i) => `<div class="scope"><div class="scope-top"><span class="lvl lvl-${scopeLevel(s).toLowerCase()}">${scopeLevel(s)}</span><b>${esc(scopeLabel(s))}</b><span class="spacer"></span>${s.option ? '<span class="badge warn">GRANT OPTION</span>' : ''}<button class="ghost" data-e="${i}">Edit</button><button class="ghost danger" data-r="${i}">Revoke all</button></div>
-        <div class="chips">${s.all ? '<span class="chip all">ALL PRIVILEGES</span>' : s.privs.map(x => `<span class="chip">${esc(x)}</span>`).join('') || '<span class="chip none">USAGE (no privileges)</span>'}${s.columns.map(x => `<span class="chip col" title="Column-level (read-only here)">${esc(x)}</span>`).join('')}${s.other.map(x => `<span class="chip col" title="Not editable here">${esc(x)}</span>`).join('')}</div></div>`).join('') : '<div class="empty">This account has no privileges</div>'}`;
+        <div class="chips">${s.all ? '<span class="chip all">ALL PRIVILEGES</span>' : s.privs.map(x => `<span class="chip">${esc(x)}</span>`).join('') || '<span class="chip none">USAGE (no privileges)</span>'}${s.columns.map(x => `<span class="chip col" title="Column-level (read-only here)">${esc(x)}</span>`).join('')}${s.other.map(x => `<span class="chip col" title="Not editable here">${esc(x)}</span>`).join('')}</div></div>`).join('') : '<div class="empty">This account has no privileges</div>'}`
+      : `<div class="scope" style="margin-top:18px"><div class="scope-top"><span class="lvl lvl-global">SQLite Catalog</span><b>All sandboxed SQLite directories</b></div><div class="chips"><span class="chip all">FULL SANDBOX ACCESS</span><span class="chip">Argon2id Auth</span></div></div>`}`;
     const reload = () => users();
+    if ($('#u-unlock')) $('#u-unlock').onclick = guard(async () => {
+        await api('unlock_account', { user: u.user, host: u.host, driver: S.driver, db_unlock: !!u.db_locked });
+        toast(`Account ${acctKey(u)} unlocked`);
+        reload();
+    });
+    if ($('#dblock')) $('#dblock').onclick = () => confirmDo(`Lock ${acctKey(u)} at the database server level (ALTER USER … ACCOUNT LOCK)?`, async () => {
+        await api('unlock_account', { user: u.user, host: u.host, driver: S.driver, db_lock: true });
+        toast(`Account ${acctKey(u)} locked on server`);
+        reload();
+    });
     $('#pw').onclick = () => modal(`<h3>Change password</h3><p style="color:var(--mute)">${esc(acctKey(u))}</p><label>New password<input name="pass" type="password" required autofocus></label>`, async v => { await api('set_password', { ...u, pass: v.pass }); toast('Password changed'); });
     $('#du').onclick = () => confirmDo(`Drop account ${acctKey(u)}? This cannot be undone.${isMe ? ' WARNING: this is the account you are signed in with.' : ''}`, async () => { await api('drop_user', u); S.acct = null; toast('Account dropped'); reload(); });
-    $('#ad').querySelectorAll('[data-e]').forEach(b => b.onclick = () => grantEditor(u, g.scopes[b.dataset.e], g.catalog, me, reload));
-    $('#ad').querySelectorAll('[data-r]').forEach(b => b.onclick = () => { const s = g.scopes[b.dataset.r]; confirmDo(`Revoke all privileges on ${scopeLabel(s)} from ${acctKey(u)}?`, async () => { await api('set_grants', { ...u, scope_db: s.db, scope_table: s.table, privileges: [], grant_option: false }); toast('Privileges revoked'); reload(); }); });
-    $('#ap').onclick = () => scopePicker(u, g, me, reload);
+    if (my) {
+        $('#ad').querySelectorAll('[data-e]').forEach(b => b.onclick = () => grantEditor(u, g.scopes[b.dataset.e], g.catalog, me, reload));
+        $('#ad').querySelectorAll('[data-r]').forEach(b => b.onclick = () => { const s = g.scopes[b.dataset.r]; confirmDo(`Revoke all privileges on ${scopeLabel(s)} from ${acctKey(u)}?`, async () => { await api('set_grants', { ...u, scope_db: s.db, scope_table: s.table, privileges: [], grant_option: false }); toast('Privileges revoked'); reload(); }); });
+        $('#ap').onclick = () => scopePicker(u, g, me, reload);
+    }
 }
 
 function scopePicker(u, g, me, reload) {
@@ -1255,6 +1343,8 @@ async function dbsHome() {
             </div>
           </div>
           <div class="kv"><span>Authentication</span><b>${my ? 'Libsodium Split-Key + CSRF' : 'Config Argon2id + Split-Key + CSRF'}</b></div>
+          <div class="kv"><span>Brute-Force Policy</span><b>Lockout at ${info.max_login_attempts || 5} fails · ${Math.round((info.session_idle_ttl || 3600) / 60)}m idle timeout</b></div>
+          ${info.locked_accounts_count ? `<div class="kv"><span style="color:var(--danger)">Locked Accounts</span><b><a href="#" id="d-lck" class="crumb" style="color:var(--danger)">🔒 ${info.locked_accounts_count} account(s) locked — Manage →</a></b></div>` : ''}
           <div class="kv"><span>Theme</span><b>${document.documentElement.dataset.theme === 'light' ? 'Light mode' : 'Dark mode'} <a href="#" id="d-th" class="crumb" style="margin-left:6px">Switch</a></b></div>
           <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
             <small style="color:var(--mute);font-weight:600">Default Preferences (saved in browser)</small>
@@ -1319,6 +1409,7 @@ async function dbsHome() {
     </div>`;
 
     $('#d-th').onclick = e => { e.preventDefault(); $('#theme').click(); dbsHome(); };
+    if ($('#d-lck')) $('#d-lck').onclick = e => { e.preventDefault(); S.db = null; S.table = null; S.tab = 'users'; render(); };
     if ($('#d-dirs')) $('#d-dirs').onclick = guard(manageSqliteDirs);
     if ($('#d-dirs2')) $('#d-dirs2').onclick = guard(manageSqliteDirs);
     if ($('#p-eng')) $('#p-eng').onchange = e => { savePrefs({ engine: e.target.value }); toast('Default engine saved'); };

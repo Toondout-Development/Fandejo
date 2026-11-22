@@ -1,11 +1,41 @@
 <?php
 declare(strict_types=1);
+if (PHP_SAPI === 'cli' && isset($argv[1]) && str_starts_with($argv[1], '--unlock')) {
+    $target = str_contains($argv[1], '=') ? trim(substr($argv[1], strpos($argv[1], '=') + 1)) : ($argv[2] ?? '');
+    $root = dirname(__DIR__);
+    $files = array_filter([
+        $root . '/.fandejo_locks.json',
+        sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json',
+    ], 'is_file');
+    if (!$files) { echo "No active lockout file found.\n"; exit(0); }
+    foreach ($files as $f) {
+        if ($target === '') {
+            @unlink($f);
+            echo "Cleared all Fandejo account and IP lockouts ($f).\n";
+        } else {
+            $data = json_decode((string)@file_get_contents($f), true) ?: ['accounts' => [], 'ips' => []];
+            $removed = 0;
+            foreach (array_keys($data['accounts'] ?? []) as $k) {
+                $u = $data['accounts'][$k]['user'] ?? '';
+                if ($k === $target || strcasecmp($u, $target) === 0) { unset($data['accounts'][$k]); $removed++; }
+            }
+            if (isset($data['ips'][$target])) { unset($data['ips'][$target]); $removed++; }
+            @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+            echo "Unlocked '$target' ($removed entry removed from $f).\n";
+        }
+    }
+    exit(0);
+}
+ini_set('session.use_strict_mode', '1');
+ini_set('session.use_only_cookies', '1');
 $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
 session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
 session_start();
 header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
+header('Referrer-Policy: no-referrer');
+header('Cache-Control: no-store, no-cache, must-revalidate');
 
 function out($data, int $code = 200): never { http_response_code($code); echo json_encode($data, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR); exit; }
 function fail(string $m, int $code = 400): never { out(['error' => $m], $code); }
@@ -41,6 +71,12 @@ function clear_auth(): void {
     setcookie('typhon_key', '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
     if (session_status() === PHP_SESSION_ACTIVE) session_destroy();
 }
+function session_fingerprint(): string {
+    return hash('sha256', ($_SERVER['HTTP_USER_AGENT'] ?? '') . '|' . ($_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? ''));
+}
+function client_ip(): string {
+    return (string)($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1');
+}
 
 function q(string $id, string $drv): string {
     return $drv === 'mysql' ? '`' . str_replace('`', '``', $id) . '`' : '"' . str_replace('"', '""', $id) . '"';
@@ -75,16 +111,224 @@ function fandejo_config(): array {
         $envUser = getenv('FANDEJO_SQLITE_USER') ?: 'admin';
         $users[$envUser] = $envHash;
     }
-    return ['cfg_file' => $cfgFile ?? (dirname(__DIR__) . '/config.php'), 'sqlite_dirs' => $cleanDirs, 'sqlite_users' => $users];
+    return [
+        'cfg_file' => $cfgFile ?? (dirname(__DIR__) . '/config.php'),
+        'sqlite_dirs' => $cleanDirs,
+        'sqlite_users' => $users,
+        'max_login_attempts' => max(2, (int)($raw['max_login_attempts'] ?? 5)),
+        'admin_lockout_seconds' => max(60, (int)($raw['admin_lockout_seconds'] ?? 900)),
+        'ip_max_attempts' => max(3, (int)($raw['ip_max_attempts'] ?? 12)),
+        'ip_lockout_seconds' => max(60, (int)($raw['ip_lockout_seconds'] ?? 900)),
+        'session_idle_ttl' => max(300, (int)($raw['session_idle_ttl'] ?? 3600)),
+    ];
 }
 
 function save_sqlite_config(array $dirs, array $users): void {
-    $target = dirname(__DIR__) . '/config.php';
-    $code = "<?php\n// Fandejo Configuration — generated " . date('c') . "\nreturn " . var_export(['sqlite_dirs' => array_values($dirs), 'sqlite_users' => $users], true) . ";\n";
-    if (@file_put_contents($target, $code, LOCK_EX) === false) {
+    $cfgFile = is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (dirname(__DIR__) . '/config.php');
+    $existing = is_file($cfgFile) ? (require $cfgFile) : [];
+    if (!is_array($existing)) $existing = [];
+    $existing['sqlite_dirs'] = array_values($dirs);
+    $existing['sqlite_users'] = $users;
+    $code = "<?php\n// Fandejo Configuration — updated " . date('c') . "\nreturn " . var_export($existing, true) . ";\n";
+    if (@file_put_contents($cfgFile, $code, LOCK_EX) === false) {
         fail('Unable to write config.php — check directory permissions or create config.php from config.example.php');
     }
-    @chmod($target, 0600);
+    @chmod($cfgFile, 0600);
+}
+
+/** Persistent brute-force & account lockout store (.fandejo_locks.json in project root, fallback to sys_get_temp_dir). */
+function locks_file_path(): string {
+    $root = dirname(__DIR__);
+    $p = $root . '/.fandejo_locks.json';
+    if (is_file($p) || is_writable($root)) return $p;
+    return sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json';
+}
+function load_locks(): array {
+    $f = locks_file_path();
+    if (!is_file($f)) return ['accounts' => [], 'ips' => []];
+    $raw = @file_get_contents($f);
+    $data = $raw ? json_decode($raw, true) : null;
+    if (!is_array($data)) return ['accounts' => [], 'ips' => []];
+    // Normalize legacy account entries without by_ip map
+    $accts = [];
+    foreach ($data['accounts'] ?? [] as $k => $a) {
+        if (!is_array($a)) continue;
+        if (!isset($a['by_ip']) || !is_array($a['by_ip'])) {
+            $lip = $a['last_ip'] ?? '127.0.0.1';
+            $a['by_ip'] = [$lip => [
+                'ip' => $lip,
+                'attempts' => (int)($a['attempts'] ?? 0),
+                'locked' => !empty($a['locked']),
+                'locked_at' => $a['locked_at'] ?? ($a['last_failed'] ?? time()),
+                'last_failed' => $a['last_failed'] ?? time(),
+            ]];
+        }
+        $accts[$k] = $a;
+    }
+    return ['accounts' => $accts, 'ips' => $data['ips'] ?? []];
+}
+function save_locks(array $data): void {
+    $f = locks_file_path();
+    @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+    @chmod($f, 0600);
+}
+function recompute_acct_lock_summary(array &$acct): void {
+    $byIp = $acct['by_ip'] ?? [];
+    $total = 0;
+    $anyLocked = false;
+    $lastFailed = 0;
+    $lastIp = $acct['last_ip'] ?? '';
+    foreach ($byIp as $ip => $entry) {
+        $total += (int)($entry['attempts'] ?? 0);
+        if (!empty($entry['locked'])) $anyLocked = true;
+        if (($entry['last_failed'] ?? 0) >= $lastFailed) {
+            $lastFailed = (int)($entry['last_failed'] ?? 0);
+            $lastIp = (string)$ip;
+        }
+    }
+    $acct['attempts'] = $total;
+    $acct['locked'] = $anyLocked;
+    $acct['global_locked'] = !empty($acct['global_locked']);
+    if ($acct['global_locked']) $acct['locked'] = true;
+    $acct['last_failed'] = $lastFailed ?: ($acct['last_failed'] ?? time());
+    $acct['last_ip'] = $lastIp;
+}
+/**
+ * Check if ($drv, $user) is permitted to attempt authentication from the current IP.
+ * Returns true if the account is in "admin cooldown recovery probe" mode (meaning authentication
+ * MUST only succeed if the credentials are valid AND the user is a full administrator).
+ */
+function check_login_lock(string $drv, string $user): bool {
+    $cfg = fandejo_config();
+    $locks = load_locks();
+    $ip = client_ip();
+    $now = time();
+    $acctKey = strtolower($drv) . ':' . $user;
+    $adminCooldown = $cfg['admin_lockout_seconds'];
+
+    // 1. Check temporary IP-wide rate limit across accounts
+    $ipEntry = $locks['ips'][$ip] ?? null;
+    if ($ipEntry && !empty($ipEntry['locked_until'])) {
+        if ($now < $ipEntry['locked_until']) {
+            $rem = max(1, (int)ceil(($ipEntry['locked_until'] - $now) / 60));
+            fail("Too many failed login attempts from your IP ($ip). Try again in {$rem} minute(s), or run `php public/api.php --unlock` on the server.", 429);
+        }
+        unset($locks['ips'][$ip]);
+        save_locks($locks);
+    }
+
+    // 2. Check account lockouts (global admin lock or per-IP hard lock)
+    $acct = $locks['accounts'][$acctKey] ?? null;
+    if (!$acct) return false;
+
+    $ipLock = $acct['by_ip'][$ip] ?? null;
+    $isGlobalLocked = !empty($acct['global_locked']);
+    $isIpLocked = !empty($ipLock['locked']);
+
+    if (!$isGlobalLocked && !$isIpLocked) {
+        // An attacker on another IP may be locked out on this account, but THIS client IP is clean!
+        return false;
+    }
+
+    $lockedAt = (int)($isIpLocked ? ($ipLock['locked_at'] ?? $now) : ($acct['locked_at'] ?? $now));
+    $elapsed = $now - $lockedAt;
+
+    // 3. Anti-deadlock self-recovery window for full-privilege administrators:
+    // Once admin_lockout_seconds has elapsed, allow a credential check that ONLY succeeds if the user is a full admin.
+    if ($elapsed >= $adminCooldown) {
+        return true; // Admin recovery probe mode
+    }
+
+    $remMin = max(1, (int)ceil(($adminCooldown - $elapsed) / 60));
+    $attempts = (int)($ipLock['attempts'] ?? ($acct['attempts'] ?? $cfg['max_login_attempts']));
+    fail("Account '$user' is locked for your IP ($ip) after $attempts failed attempts. An administrator can unlock it in the Users panel (or sign in from another IP, wait {$remMin}m for admin cooldown, or run `php public/api.php --unlock`).", 423);
+}
+function record_login_failure(string $drv, string $user, string $reason = 'Authentication failed'): never {
+    $cfg = fandejo_config();
+    $locks = load_locks();
+    $ip = client_ip();
+    $now = time();
+    $maxAcct = $cfg['max_login_attempts'];
+    $maxIp = $cfg['ip_max_attempts'];
+    $acctKey = strtolower($drv) . ':' . ($user !== '' ? $user : '(empty)');
+
+    $acct = $locks['accounts'][$acctKey] ?? ['driver' => $drv, 'user' => $user, 'attempts' => 0, 'locked' => false, 'global_locked' => false, 'by_ip' => []];
+    $acct['driver'] = $drv;
+    $acct['user'] = $user;
+    $ipSlot = $acct['by_ip'][$ip] ?? ['ip' => $ip, 'attempts' => 0, 'locked' => false, 'locked_at' => null, 'last_failed' => $now];
+    $ipSlot['attempts'] = ((int)($ipSlot['attempts'] ?? 0)) + 1;
+    $ipSlot['last_failed'] = $now;
+    if ($ipSlot['attempts'] >= $maxAcct && $user !== '') {
+        $ipSlot['locked'] = true;
+        $ipSlot['locked_at'] = $now; // Reset cooldown timer on repeated bad attempt
+    }
+    $acct['by_ip'][$ip] = $ipSlot;
+    recompute_acct_lock_summary($acct);
+    $locks['accounts'][$acctKey] = $acct;
+
+    $ipEntry = $locks['ips'][$ip] ?? ['ip' => $ip, 'attempts' => 0, 'last_failed' => $now, 'locked_until' => null];
+    if (($now - ($ipEntry['last_failed'] ?? 0)) > $cfg['ip_lockout_seconds']) {
+        $ipEntry['attempts'] = 0;
+    }
+    $ipEntry['attempts'] = ((int)($ipEntry['attempts'] ?? 0)) + 1;
+    $ipEntry['last_failed'] = $now;
+    $ipEntry['last_user'] = $user;
+    if ($ipEntry['attempts'] >= $maxIp) {
+        $ipEntry['locked_until'] = $now + $cfg['ip_lockout_seconds'];
+    }
+    $locks['ips'][$ip] = $ipEntry;
+    save_locks($locks);
+
+    // Progressive tarpit delay (350ms * attempts from this IP, capped at 2s)
+    usleep(min(2000000, $ipSlot['attempts'] * 350000));
+
+    if (!empty($ipSlot['locked'])) {
+        $mins = max(1, (int)ceil($cfg['admin_lockout_seconds'] / 60));
+        fail("Account '$user' is now locked for your IP ($ip) after {$ipSlot['attempts']} failed attempts. An administrator must unlock it (or wait {$mins}m for admin cooldown / run `php public/api.php --unlock`).", 423);
+    }
+    $rem = max(0, $maxAcct - $ipSlot['attempts']);
+    fail("$reason ($rem attempt" . ($rem === 1 ? '' : 's') . " remaining from your IP before lockout)", 401);
+}
+function clear_login_failures(string $drv, string $user): void {
+    $locks = load_locks();
+    $ip = client_ip();
+    $acctKey = strtolower($drv) . ':' . $user;
+    $changed = false;
+    // Clear failures for this client IP only, preserving any attacker IPs still locked on this account so the admin can review them
+    if (isset($locks['accounts'][$acctKey]['by_ip'][$ip])) {
+        unset($locks['accounts'][$acctKey]['by_ip'][$ip]);
+        if (!empty($locks['accounts'][$acctKey]['global_locked'])) {
+            $locks['accounts'][$acctKey]['global_locked'] = false;
+        }
+        if (empty($locks['accounts'][$acctKey]['by_ip'])) {
+            unset($locks['accounts'][$acctKey]);
+        } else {
+            recompute_acct_lock_summary($locks['accounts'][$acctKey]);
+        }
+        $changed = true;
+    }
+    if (isset($locks['ips'][$ip])) {
+        unset($locks['ips'][$ip]);
+        $changed = true;
+    }
+    if ($changed) save_locks($locks);
+}
+/** Determine whether the currently signed-in user has administrative privileges to manage lockouts & users. */
+function is_full_admin(?PDO $p, string $drv, array $c): bool {
+    if ($drv === 'sqlite') return true;
+    if (!$p) return false;
+    try {
+        foreach (parse_grants($p, $c['user'], '%') as $s) {
+            if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
+        }
+    } catch (Throwable) {}
+    try {
+        $lines = array_column($p->query('SHOW GRANTS CURRENT_USER()')->fetchAll(PDO::FETCH_NUM), 0);
+        foreach (parse_grant_lines($lines) as $s) {
+            if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
+        }
+    } catch (Throwable) {}
+    return false;
 }
 
 /** Ensure primary SQLite sandbox directory exists and return canonical realpaths of all allowed directories. */
@@ -488,15 +732,28 @@ $in = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
 $a = $_GET['a'] ?? '';
 
 if ($a === 'session') {
-    $ok = isset($_SESSION['c']['sealed_pass']) && open_secret($_SESSION['c']['sealed_pass']) !== null;
-    if (!$ok && isset($_SESSION['c'])) clear_auth();
     $cfg = fandejo_config();
+    $ok = isset($_SESSION['c']['sealed_pass']) && open_secret($_SESSION['c']['sealed_pass']) !== null;
+    if ($ok) {
+        $now = time();
+        $fp = session_fingerprint();
+        if ((!empty($_SESSION['c']['fp']) && !hash_equals($_SESSION['c']['fp'], $fp))
+            || (!empty($_SESSION['c']['last_active']) && ($now - $_SESSION['c']['last_active']) > $cfg['session_idle_ttl'])) {
+            clear_auth();
+            $ok = false;
+        } else {
+            $_SESSION['c']['last_active'] = $now;
+        }
+    }
+    if (!$ok && isset($_SESSION['c'])) clear_auth();
     out([
         'auth' => $ok,
         'driver' => $ok ? $_SESSION['c']['driver'] : null,
         'user' => $ok ? $_SESSION['c']['user'] : null,
         'sqlite_setup' => empty($cfg['sqlite_users']),
         'sqlite_dirs' => sqlite_allowed_dirs(),
+        'max_login_attempts' => $cfg['max_login_attempts'],
+        'session_idle_ttl' => $cfg['session_idle_ttl'],
     ]);
 }
 if ($a === 'login') {
@@ -504,6 +761,7 @@ if ($a === 'login') {
     $c = ['driver' => $drvIn,
           'host' => $in['host'] ?? '127.0.0.1', 'port' => (int)($in['port'] ?? 3306),
           'user' => trim((string)($in['user'] ?? '')), 'pass' => (string)($in['pass'] ?? ''), 'db' => $in['db'] ?? ''];
+    $mustBeAdmin = $c['user'] !== '' ? check_login_lock($drvIn, $c['user']) : false;
     if ($drvIn === 'sqlite') {
         $cfg = fandejo_config();
         if ($c['user'] === '' || $c['pass'] === '') fail('Username and password are required for SQLite access', 401);
@@ -518,23 +776,47 @@ if ($a === 'login') {
         } else {
             $hash = $cfg['sqlite_users'][$c['user']] ?? null;
             if (!$hash || !password_verify($c['pass'], $hash)) {
-                fail('Invalid SQLite username or password', 401);
+                record_login_failure('sqlite', $c['user'], 'Invalid SQLite username or password');
             }
         }
         sqlite_allowed_dirs();
     } else {
-        try { connect($c); } catch (Throwable $e) { fail($e->getMessage(), 401); }
+        if ($c['user'] === '') fail('Username is required', 401);
+        try { $pdoLogin = connect($c); } catch (Throwable $e) {
+            record_login_failure('mysql', $c['user'], $e->getMessage());
+        }
+        // If this login was permitted only via the admin cooldown self-recovery window, verify the account is a full admin
+        if ($mustBeAdmin && !is_full_admin($pdoLogin, 'mysql', $c)) {
+            fail("Account '{$c['user']}' remains locked. Only an administrator with full privileges can self-unlock after the cooldown period.", 423);
+        }
     }
+    clear_login_failures($drvIn, $c['user']);
     session_regenerate_id(true);
     $sealed = seal_secret($c['pass']);
     unset($c['pass']);
     $c['sealed_pass'] = $sealed;
+    $c['fp'] = session_fingerprint();
+    $c['created_at'] = time();
+    $c['last_active'] = time();
     $_SESSION['c'] = $c;
     $_SESSION['csrf'] = bin2hex(random_bytes(16));
     out(['ok' => true, 'csrf' => $_SESSION['csrf']]);
 }
 if (!isset($_SESSION['c']['sealed_pass'])) fail('Not authenticated', 401);
 if ($a === 'logout') { clear_auth(); out(['ok' => true]); }
+
+$cfg = fandejo_config();
+$now = time();
+if (!empty($_SESSION['c']['fp']) && !hash_equals($_SESSION['c']['fp'], session_fingerprint())) {
+    clear_auth();
+    fail('Session security fingerprint mismatch; please sign in again', 401);
+}
+if (!empty($_SESSION['c']['last_active']) && ($now - $_SESSION['c']['last_active']) > $cfg['session_idle_ttl']) {
+    clear_auth();
+    fail('Session expired due to inactivity; please sign in again', 401);
+}
+$_SESSION['c']['last_active'] = $now;
+
 if ($a === 'csrf') out(['csrf' => $_SESSION['csrf']]);
 if (($_SERVER['HTTP_X_CSRF'] ?? '') !== $_SESSION['csrf']) fail('Bad CSRF token', 403);
 
@@ -547,7 +829,7 @@ $db = $in['db'] ?? ($_GET['db'] ?? null);
 $tb = $in['table'] ?? ($_GET['table'] ?? null);
 
 try {
-    $noConnectActions = ['databases', 'create_db', 'drop_db', 'server_info', 'server_meta', 'change_own_password', 'sqlite_dirs', 'set_sqlite_dirs'];
+    $noConnectActions = ['databases', 'create_db', 'drop_db', 'server_info', 'server_meta', 'change_own_password', 'sqlite_dirs', 'set_sqlite_dirs', 'users', 'create_user', 'drop_user', 'set_password', 'lockouts', 'unlock_account'];
     $p = ($drv === 'sqlite' && in_array($a, $noConnectActions, true)) ? null : connect($c, $db);
     $T = $tb !== null ? ($drv === 'mysql' ? q((string)$db, $drv) . '.' : '') . q((string)$tb, $drv) : '';
 
@@ -615,7 +897,15 @@ try {
             'extensions' => array_values(array_intersect(['PDO', 'pdo_mysql', 'pdo_sqlite', 'mysqli', 'sqlite3', 'sodium', 'json', 'mbstring', 'openssl', 'zlib'], get_loaded_extensions())),
             'memory_limit' => ini_get('memory_limit'),
             'upload_max_filesize' => ini_get('upload_max_filesize'),
+            'is_admin' => is_full_admin($p, $drv, $c),
+            'max_login_attempts' => $cfg['max_login_attempts'],
+            'session_idle_ttl' => $cfg['session_idle_ttl'],
         ];
+        if ($info['is_admin']) {
+            $locks = load_locks();
+            $lockedCount = count(array_filter($locks['accounts'] ?? [], fn($a) => !empty($a['locked'])));
+            $info['locked_accounts_count'] = $lockedCount;
+        }
         if ($drv === 'mysql') {
             $ver = (string)$p->query('SELECT VERSION()')->fetchColumn();
             $cu = (string)$p->query('SELECT CURRENT_USER()')->fetchColumn();
@@ -1216,12 +1506,102 @@ try {
         out(['sql' => $sql]);
 
     case 'users':
-        if ($drv !== 'mysql') fail('User management requires MySQL/MariaDB');
+        $isAdmin = is_full_admin($p, $drv, $c);
+        $locks = load_locks();
+        if ($drv === 'sqlite') {
+            $uList = [];
+            foreach (array_keys($cfg['sqlite_users']) as $su) {
+                $lk = $locks['accounts']['sqlite:' . $su] ?? null;
+                $uList[] = [
+                    'user' => $su,
+                    'host' => 'sqlite-sandbox',
+                    'scopes' => [['db' => '*', 'table' => '*', 'privs' => ['ALL'], 'all' => true, 'option' => true, 'columns' => [], 'other' => []]],
+                    'fandejo_locked' => !empty($lk['locked']),
+                    'failed_attempts' => (int)($lk['attempts'] ?? 0),
+                    'last_failed' => $lk['last_failed'] ?? null,
+                    'last_ip' => $lk['last_ip'] ?? null,
+                    'by_ip' => array_values($lk['by_ip'] ?? []),
+                    'db_locked' => false,
+                ];
+            }
+            out(['users' => $uList, 'me' => $c['user'], 'is_admin' => true, 'lockouts' => $locks, 'max_login_attempts' => $cfg['max_login_attempts'], 'admin_lockout_seconds' => $cfg['admin_lockout_seconds']]);
+        }
+        $dbLocks = [];
+        try {
+            foreach (rows($p, 'SELECT User user, Host host, account_locked locked FROM mysql.user') as $lr) {
+                $dbLocks[$lr['user'] . '@' . $lr['host']] = strtoupper((string)($lr['locked'] ?? 'N')) === 'Y';
+            }
+        } catch (Throwable) {
+            // MariaDB fallback: check account_locked in mysql.global_priv JSON Priv column
+            try {
+                foreach (rows($p, 'SELECT User user, Host host, Priv priv FROM mysql.global_priv') as $lr) {
+                    $pj = json_decode((string)($lr['priv'] ?? '{}'), true);
+                    $dbLocks[$lr['user'] . '@' . $lr['host']] = !empty($pj['account_locked']);
+                }
+            } catch (Throwable) {}
+        }
         $r = rows($p, 'SELECT User user, Host host FROM mysql.user ORDER BY 1,2');
         foreach ($r as &$u) {
             try { $u['scopes'] = parse_grants($p, $u['user'], $u['host']); } catch (Throwable $e) { $u['scopes'] = []; }
+            $lk = $locks['accounts']['mysql:' . $u['user']] ?? null;
+            $u['fandejo_locked'] = !empty($lk['locked']);
+            $u['failed_attempts'] = (int)($lk['attempts'] ?? 0);
+            $u['last_failed'] = $lk['last_failed'] ?? null;
+            $u['last_ip'] = $lk['last_ip'] ?? null;
+            $u['by_ip'] = array_values($lk['by_ip'] ?? []);
+            $u['db_locked'] = !empty($dbLocks[$u['user'] . '@' . $u['host']]);
         }
-        out(['users' => $r, 'me' => $c['user']]);
+        out(['users' => $r, 'me' => $c['user'], 'is_admin' => $isAdmin, 'lockouts' => $isAdmin ? $locks : ['accounts' => [], 'ips' => []], 'max_login_attempts' => $cfg['max_login_attempts'], 'admin_lockout_seconds' => $cfg['admin_lockout_seconds']]);
+
+    case 'lockouts':
+        if (!is_full_admin($p, $drv, $c)) fail('Administrator privileges required to view lockouts', 403);
+        out(['lockouts' => load_locks(), 'max_login_attempts' => $cfg['max_login_attempts'], 'admin_lockout_seconds' => $cfg['admin_lockout_seconds']]);
+
+    case 'unlock_account':
+        if (!is_full_admin($p, $drv, $c)) fail('Full administrator privileges required to unlock accounts', 403);
+        $locks = load_locks();
+        $targetUser = trim((string)($in['user'] ?? ''));
+        $targetDrv = strtolower(trim((string)($in['driver'] ?? $drv)));
+        $targetHost = trim((string)($in['host'] ?? ''));
+        $targetIp = trim((string)($in['ip'] ?? ''));
+
+        if (!empty($in['clear_all'])) {
+            $locks = ['accounts' => [], 'ips' => []];
+            save_locks($locks);
+            out(['ok' => true]);
+        }
+        if ($targetUser !== '' && $targetIp !== '') {
+            // Unlock a specific (account, IP) slot
+            $acctKey = $targetDrv . ':' . $targetUser;
+            unset($locks['accounts'][$acctKey]['by_ip'][$targetIp], $locks['ips'][$targetIp]);
+            if (empty($locks['accounts'][$acctKey]['by_ip']) && empty($locks['accounts'][$acctKey]['global_locked'])) {
+                unset($locks['accounts'][$acctKey]);
+            } elseif (isset($locks['accounts'][$acctKey])) {
+                recompute_acct_lock_summary($locks['accounts'][$acctKey]);
+            }
+            save_locks($locks);
+            out(['ok' => true]);
+        }
+        if ($targetIp !== '') {
+            unset($locks['ips'][$targetIp]);
+            save_locks($locks);
+            out(['ok' => true]);
+        }
+        if ($targetUser !== '') {
+            $acctKey = $targetDrv . ':' . $targetUser;
+            foreach (array_keys($locks['accounts'][$acctKey]['by_ip'] ?? []) as $lip) {
+                unset($locks['ips'][$lip]);
+            }
+            unset($locks['accounts'][$acctKey]);
+            save_locks($locks);
+        }
+        if ($drv === 'mysql' && !empty($in['db_unlock']) && $targetUser !== '' && $targetHost !== '') {
+            $p->exec('ALTER USER ' . acct_sql($p, $targetUser, $targetHost) . ' ACCOUNT UNLOCK');
+        }
+        if ($drv === 'mysql' && !empty($in['db_lock']) && $targetUser !== '' && $targetHost !== '') {
+            $p->exec('ALTER USER ' . acct_sql($p, $targetUser, $targetHost) . ' ACCOUNT LOCK');
+        }
+        out(['ok' => true]);
 
     case 'user_grants':
         if ($drv !== 'mysql') fail('MySQL only');
@@ -1247,17 +1627,43 @@ try {
         out(['ok' => true, 'statements' => $st]);
 
     case 'set_password':
-        if ($drv !== 'mysql') fail('MySQL only');
         if (($in['pass'] ?? '') === '') fail('Password required');
+        if ($drv === 'sqlite') {
+            if (strlen((string)$in['pass']) < 6) fail('Password must be at least 6 characters');
+            $targetUser = trim((string)($in['user'] ?? ''));
+            if ($targetUser === '' || !isset($cfg['sqlite_users'][$targetUser])) fail('SQLite user not found');
+            $users = $cfg['sqlite_users'];
+            $users[$targetUser] = password_hash((string)$in['pass'], defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT);
+            save_sqlite_config($cfg['sqlite_dirs'], $users);
+            if ($targetUser === $c['user']) $_SESSION['c']['sealed_pass'] = seal_secret((string)$in['pass']);
+            out(['ok' => true]);
+        }
         $p->exec('ALTER USER ' . acct_sql($p, $in['user'], $in['host']) . ' IDENTIFIED BY ' . $p->quote($in['pass'])); out(['ok' => true]);
 
     case 'create_user':
-        if ($drv !== 'mysql') fail('MySQL only');
-        $p->exec('CREATE USER ' . $p->quote($in['user']) . '@' . $p->quote($in['host'] ?? '%') . ' IDENTIFIED BY ' . $p->quote($in['pass']));
-        if (!empty($in['grant_db'])) $p->exec('GRANT ALL PRIVILEGES ON ' . q($in['grant_db'], 'mysql') . '.* TO ' . $p->quote($in['user']) . '@' . $p->quote($in['host'] ?? '%'));
+        $newUser = trim((string)($in['user'] ?? ''));
+        if ($newUser === '') fail('Username is required');
+        if ($drv === 'sqlite') {
+            if (strlen((string)($in['pass'] ?? '')) < 6) fail('Password must be at least 6 characters');
+            $users = $cfg['sqlite_users'];
+            if (isset($users[$newUser])) fail("SQLite user '$newUser' already exists");
+            $users[$newUser] = password_hash((string)$in['pass'], defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT);
+            save_sqlite_config($cfg['sqlite_dirs'], $users);
+            out(['ok' => true]);
+        }
+        $p->exec('CREATE USER ' . $p->quote($newUser) . '@' . $p->quote($in['host'] ?? '%') . ' IDENTIFIED BY ' . $p->quote($in['pass']));
+        if (!empty($in['grant_db'])) $p->exec('GRANT ALL PRIVILEGES ON ' . q($in['grant_db'], 'mysql') . '.* TO ' . $p->quote($newUser) . '@' . $p->quote($in['host'] ?? '%'));
         out(['ok' => true]);
     case 'drop_user':
-        if ($drv !== 'mysql') fail('MySQL only');
+        if ($drv === 'sqlite') {
+            $targetUser = trim((string)($in['user'] ?? ''));
+            $users = $cfg['sqlite_users'];
+            if (!isset($users[$targetUser])) fail('SQLite user not found');
+            if (count($users) <= 1) fail('Cannot delete the only SQLite administrator account');
+            unset($users[$targetUser]);
+            save_sqlite_config($cfg['sqlite_dirs'], $users);
+            out(['ok' => true]);
+        }
         $p->exec('DROP USER ' . $p->quote($in['user']) . '@' . $p->quote($in['host'])); out(['ok' => true]);
 
     default: fail('Unknown action', 404);

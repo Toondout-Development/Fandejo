@@ -22,4 +22,11 @@ return [
     'sqlite_users' => [
         // 'admin' => '$argon2id$v=19$m=65536,t=4,p=1$...',
     ],
+
+    // Authentication brute-force protection & session hardening:
+    'max_login_attempts'    => 5,      // Hard lockout after N consecutive failed attempts (per account + IP)
+    'admin_lockout_seconds' => 900,    // Self-lockout recovery window (15m): lets a full admin sign in with a valid password after cooldown
+    'ip_max_attempts'       => 12,     // Temporary IP rate-limit threshold across accounts
+    'ip_lockout_seconds'    => 900,    // Temporary IP cooldown window (15 minutes)
+    'session_idle_ttl'      => 3600,   // Auto-expire idle sessions after N seconds (1 hour)
 ];
