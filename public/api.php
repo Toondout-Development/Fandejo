@@ -1265,7 +1265,17 @@ try {
         foreach ($rawCols as $rc) {
             $cn = $drv === 'sqlite' ? $rc['name'] : $rc['Field'];
             $ct = $drv === 'sqlite' ? $rc['type'] : $rc['Type'];
-            $colMeta[$cn] = parse_coltype($ct) + ['raw_type' => $ct, 'null' => $drv === 'sqlite' ? (!$rc['notnull'] && !$rc['pk']) : ($rc['Null'] === 'YES')];
+            $pt = parse_coltype($ct);
+            $isAi = $drv === 'sqlite'
+                ? (!empty($rc['pk']) && in_array($pt['base'], ['INTEGER', 'INT'], true))
+                : (stripos((string)($rc['Extra'] ?? ''), 'auto_increment') !== false);
+            $colMeta[$cn] = $pt + [
+                'raw_type' => $ct,
+                'null' => $drv === 'sqlite' ? (!$rc['notnull'] && !$rc['pk']) : ($rc['Null'] === 'YES'),
+                'ai' => $isAi,
+                'extra' => $drv === 'sqlite' ? ($isAi ? 'rowid auto' : '') : ($rc['Extra'] ?? ''),
+                'has_default' => $drv === 'sqlite' ? ($rc['dflt_value'] !== null) : (($rc['Default'] ?? null) !== null),
+            ];
         }
         $args = [];
         [$where, $order] = filter_sql($drv, $cols, $in, $args);

@@ -269,7 +269,7 @@ async function browse() {
       <select id="per">${[25, 50, 100, 250].map(n => `<option ${n === r.per ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
       ${filterBarHtml}
       <div class="tw"><table><tr>${r.rows.length ? `<th style="width:1%;cursor:default"><input type="checkbox" id="sel-all" title="Select all rows on this page"></th>` : ''}${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
-      ${r.rows.map((row, i) => `<tr data-ri="${i}"><td><input type="checkbox" class="rchk" data-i="${i}"></td>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
+      ${r.rows.map((row, i) => `<tr data-ri="${i}"><td><input type="checkbox" class="rchk" data-i="${i}"></td>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost" data-cp="${i}" title="Copy / duplicate row">⧉</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? `<td class="null" data-cell="${i}" data-col="${esc(c)}" title="${canEdit ? 'Double-click to edit inline' : ''}">NULL</td>` : `<td data-cell="${i}" data-col="${esc(c)}" title="${esc(row[c])}${canEdit ? ' (Double-click to edit)' : ''}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
       ${r.rows.length ? '' : '<div class="empty">No rows</div>'}`;
     $('#bs').onkeydown = e => { if (e.key === 'Enter') { B.search = e.target.value; B.page = 1; render(); } };
     $('#btf').onclick = () => { B.showFilterBar = !B.showFilterBar; render(); };
@@ -376,6 +376,116 @@ async function browse() {
         };
     }
     C().querySelectorAll('[data-x]').forEach(b => b.onclick = () => confirmDo(r.key_type === 'all' ? 'Delete this row? (Table has no primary/unique key — matching all column values)' : 'Delete this row?', async () => { await api('delete', { db: S.db, table: S.table, key: keyOf(r.rows[b.dataset.x]) }); render(); }));
+    C().querySelectorAll('[data-cp]').forEach(b => b.onclick = () => {
+        const row = r.rows[b.dataset.cp];
+        const meta = r.col_meta || {};
+        modal(`<div style="width:min(600px,80vw)"><h3>⧉ Copy / Duplicate row</h3><p style="color:var(--mute);font-size:12px;margin-top:0">Pre-filled from selected row. Auto-increment primary keys are skipped by default so a new ID is assigned.</p>${r.columns.map(c => {
+            const m = meta[c] || { base: 'VARCHAR' };
+            const isAiPk = !!m.ai || (r.pk.length === 1 && r.pk.includes(c) && ['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT'].includes((m.base || '').toUpperCase()));
+            return renderFieldInput(c, m, isAiPk ? '' : row[c], true, m.extra || (isAiPk ? 'auto_increment' : ''), isAiPk || row[c] === null);
+        }).join('')}</div>`, async f => {
+            const values = {};
+            r.columns.forEach(c => {
+                if (!f['s_' + c]) {
+                    const base = (meta[c]?.base || '').toUpperCase();
+                    let v = f['v_' + c];
+                    if (['DATETIME', 'TIMESTAMP'].includes(base)) v = v.replace('T', ' ');
+                    values[c] = v;
+                }
+            });
+            await api('insert', { db: S.db, table: S.table, values });
+            toast('Row duplicated');
+            render();
+        });
+        wireFieldInputs($('#modal form'));
+    });
+    if (canEdit) {
+        C().querySelectorAll('td[data-cell]').forEach(td => {
+            td.ondblclick = () => {
+                if (td.querySelector('.inl-wrap')) return;
+                const rIdx = +td.dataset.cell, col = td.dataset.col;
+                const row = r.rows[rIdx], m = (r.col_meta || {})[col] || { base: 'VARCHAR', null: true };
+                const base = (m.base || '').toUpperCase();
+                const origVal = row[col];
+                const vStr = origVal === null ? '' : String(origVal);
+
+                const wrap = document.createElement('div');
+                wrap.className = 'row inl-wrap';
+                wrap.style.gap = '4px';
+
+                let inp;
+                if (base === 'ENUM' && m.values?.length) {
+                    inp = document.createElement('select');
+                    inp.innerHTML = m.values.map(v => `<option ${v === vStr ? 'selected' : ''}>${esc(v)}</option>`).join('');
+                } else {
+                    inp = document.createElement('input');
+                    inp.value = vStr;
+                }
+                inp.style.cssText = 'padding:3px 6px;min-width:90px;flex:1;font-family:var(--font-mono);font-size:12px';
+                wrap.append(inp);
+
+                let nullBtn = null;
+                if (m.null) {
+                    nullBtn = document.createElement('button');
+                    nullBtn.type = 'button';
+                    nullBtn.className = 'ghost';
+                    nullBtn.style.cssText = 'padding:2px 6px;font-size:11px';
+                    nullBtn.textContent = 'NULL';
+                    nullBtn.title = 'Set column to NULL';
+                    wrap.append(nullBtn);
+                }
+
+                td.classList.remove('null');
+                td.innerHTML = '';
+                td.append(wrap);
+                inp.focus();
+                if (inp.select) inp.select();
+
+                let done = false;
+                const restore = (val) => {
+                    if (val === null) {
+                        td.className = 'null';
+                        td.textContent = 'NULL';
+                    } else {
+                        td.className = '';
+                        td.textContent = String(val);
+                        td.title = `${val} (Double-click to edit)`;
+                    }
+                };
+                const commit = async (newVal) => {
+                    if (done) return;
+                    done = true;
+                    if (newVal !== null && ['DATETIME', 'TIMESTAMP'].includes(base)) newVal = String(newVal).replace('T', ' ');
+                    if (newVal === origVal || (newVal !== null && origVal !== null && String(newVal) === String(origVal))) {
+                        return restore(origVal);
+                    }
+                    try {
+                        const rowKey = keyOf(row);
+                        await api('update', { db: S.db, table: S.table, key: rowKey, values: { [col]: newVal } });
+                        row[col] = newVal;
+                        restore(newVal);
+                        toast(`Updated ${col}`);
+                    } catch (e) {
+                        restore(origVal);
+                        toast(e.message, true);
+                    }
+                };
+                const cancel = () => {
+                    if (done) return;
+                    done = true;
+                    restore(origVal);
+                };
+
+                if (nullBtn) nullBtn.onmousedown = e => { e.preventDefault(); commit(null); };
+                inp.onkeydown = e => {
+                    if (e.key === 'Enter') { e.preventDefault(); commit(inp.value); }
+                    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+                };
+                if (inp.tagName === 'SELECT') inp.onchange = () => commit(inp.value);
+                inp.onblur = () => commit(inp.value);
+            };
+        });
+    }
     C().querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
         const row = r.rows[b.dataset.e];
         const meta = r.col_meta || {};
