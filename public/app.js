@@ -125,7 +125,7 @@ function promptNewDb() {
 async function manageSqliteDirs() {
     const r = await api('sqlite_dirs');
     modal(`<div style="width:min(640px,85vw)"><h3>📁 Manage SQLite Sandbox Directories</h3>
-      <p style="color:var(--mute);font-size:12px;margin-top:0">Fandejo treats these directories as your SQLite database catalog. Only <code>.sqlite</code>, <code>.sqlite3</code>, and <code>.db</code> files directly inside these folders can be accessed.</p>
+      <p style="color:var(--mute);font-size:12px;margin-top:0">Fandejo treats these directories as your SQLite database catalog. Only <code>.sqlite</code>, <code>.sqlite3</code>, and <code>.db</code> files directly inside these folders can be accessed.${!r.allow_any_dir && r.base_root ? ` New directories added via the UI must be inside <code>${esc(r.base_root)}</code> (or add external paths in <code>config.php</code>).` : ''}</p>
       <div id="sd-list"></div>
       <button type="button" id="sd-add" style="margin:6px 0 12px">+ Add directory path</button>
       <label class="pc"><input type="checkbox" name="create_missing" checked><span>Create missing directories</span><small>Automatically mkdir any new directory path if it does not exist yet</small></label>
@@ -613,6 +613,9 @@ async function sqlView() {
           <button class="primary" id="run">▶ Run</button>
           <button id="saveq">★ Save query</button>
           <button id="clearq" class="ghost">Clear</button>
+          <label class="row" style="font-size:12px;color:var(--mute);margin-left:6px">Max rows
+            <select id="sql-max">${[100, 500, 1000, 5000].map(n => `<option value="${n}" ${n === (S.sqlMaxRows || 1000) ? 'selected' : ''}>${n}</option>`).join('')}</select>
+          </label>
           <span class="spacer"></span>
           <small style="color:var(--mute)">Ctrl+Enter to execute</small>
         </div>
@@ -708,10 +711,11 @@ async function sqlView() {
             else return toast('Create or select an SQLite database first', true);
         }
         S.sql = ed.value;
+        S.sqlMaxRows = +($('#sql-max')?.value || S.sqlMaxRows || 1000);
         const sel = ed.value.slice(ed.selectionStart, ed.selectionEnd).trim();
         const toRun = typeof customSql === 'string' ? customSql : (sel || S.sql);
         if (!toRun.trim()) return toast('Enter a SQL query to run', true);
-        const r = await api('query', { db: S.db, sql: toRun });
+        const r = await api('query', { db: S.db, sql: toRun, max_rows: S.sqlMaxRows });
         const totalMs = r.results.reduce((a, x) => a + (x.ms || 0), 0).toFixed(2);
         const hasErr = r.results.some(x => x.error);
         const hist = loadJSON('fandejo_history').filter(h => h.sql.trim() !== toRun.trim());
@@ -720,13 +724,14 @@ async function sqlView() {
         drawSide();
 
         $('#res').innerHTML = r.results.map(x => x.error ? `<div class="msg err">${esc(x.error)}<br><small>${esc(x.sql)}</small></div>`
-            : x.rows ? `<div class="msg ok">${x.rows.length} rows · ${x.ms} ms <button class="ghost" data-csv="${r.results.indexOf(x)}">⬇ CSV</button></div><div class="tw"><table><tr>${x.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr>${x.rows.map(row => `<tr>${x.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>`
+            : x.rows ? `<div class="msg ok">${x.rows.length}${x.truncated ? `+ rows (showing first ${x.max_rows || x.rows.length} — add a LIMIT clause or raise Max rows)` : ' rows'} · ${x.ms} ms <button class="ghost" data-csv="${r.results.indexOf(x)}">⬇ CSV</button></div><div class="tw"><table><tr>${x.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr>${x.rows.map(row => `<tr>${x.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>`
                 : `<div class="msg ok">${x.affected} rows affected · ${x.ms} ms</div>`).join('');
         $('#res').querySelectorAll('[data-csv]').forEach(b => b.onclick = () => { const x = r.results[b.dataset.csv]; download(new Blob(['\uFEFF' + toCSV(x.columns, x.rows.map(row => x.columns.map(c => row[c])))], { type: 'text/csv' }), 'query.csv'); });
         if (r.results.some(x => /^\s*(create|drop|alter|rename)/i.test(x.sql)) && S.db) { await loadTables(S.db); tree(); }
     });
 
     $('#run').onclick = () => runSql();
+    if ($('#sql-max')) $('#sql-max').onchange = e => { S.sqlMaxRows = +e.target.value; };
     $('#saveq').onclick = () => promptSave(ed.value);
     $('#clearq').onclick = () => { ed.value = S.sql = ''; ed.focus(); };
     ed.oninput = () => { S.sql = ed.value; };
@@ -905,9 +910,13 @@ async function exportView() {
     f.onsubmit = guard(async e => {
         e.preventDefault(); const d = new FormData(f);
         if (f.fmt.value === 'csv') return exportCSV({ table: f.ct.value, delimiter: f.delim.value === 'tab' ? '\t' : f.delim.value, null_as: f.null_as.value, header: f.header.checked, bom: f.bom.checked });
-        const r = await api('export', { db: S.db, tables: d.getAll('t'), structure: !!d.get('structure'), data: !!d.get('data') });
-        download(new Blob([r.sql], { type: 'text/sql' }), (S.table || S.db) + '.sql');
+        return exportSQL({ tables: d.getAll('t'), structure: !!d.get('structure'), data: !!d.get('data') });
     });
+}
+async function exportSQL(o) {
+    const res = await fetch('api.php?a=export_sql', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: S.db, table: S.table, ...o }) });
+    if (!(res.headers.get('Content-Type') || '').includes('application/sql')) { const j = await res.json().catch(() => ({})); throw new Error(j.error || 'SQL export failed'); }
+    download(await res.blob(), (S.table || S.db || 'export') + '.sql'); toast('SQL export downloaded');
 }
 async function exportCSV(o) {
     const res = await fetch('api.php?a=export_csv', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: S.db, ...o }) });

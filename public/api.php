@@ -84,19 +84,23 @@ function q(string $id, string $drv): string {
 
 const SQLITE_EXTS = ['sqlite', 'sqlite3', 'db'];
 
-/** Load config.php (from project root or public/) combined with sensible defaults. */
+/** Load config.php (from project root or public/, or FANDEJO_CONFIG env var) combined with sensible defaults. */
 function fandejo_config(): array {
-    $cfgFile = is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (is_file(__DIR__ . '/config.php') ? __DIR__ . '/config.php' : null);
-    $raw = $cfgFile ? (require $cfgFile) : [];
+    $envCfg = getenv('FANDEJO_CONFIG');
+    $cfgFile = ($envCfg && is_string($envCfg))
+        ? $envCfg
+        : (is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (is_file(__DIR__ . '/config.php') ? __DIR__ . '/config.php' : null));
+    $defaultBase = ($envCfg && is_string($envCfg)) ? dirname($envCfg) : dirname(__DIR__);
+    $raw = ($cfgFile && is_file($cfgFile)) ? (require $cfgFile) : [];
     if (!is_array($raw)) $raw = [];
-    $dirs = $raw['sqlite_dirs'] ?? [dirname(__DIR__) . '/data'];
+    $dirs = $raw['sqlite_dirs'] ?? [$defaultBase . '/data'];
     if (is_string($dirs)) $dirs = [$dirs];
     $cleanDirs = [];
     foreach ($dirs as $d) {
         $d = rtrim(trim((string)$d), '/\\');
         if ($d !== '') $cleanDirs[] = $d;
     }
-    if (!$cleanDirs) $cleanDirs = [dirname(__DIR__) . '/data'];
+    if (!$cleanDirs) $cleanDirs = [$defaultBase . '/data'];
     $users = [];
     if (!empty($raw['sqlite_users']) && is_array($raw['sqlite_users'])) {
         foreach ($raw['sqlite_users'] as $u => $h) {
@@ -112,8 +116,10 @@ function fandejo_config(): array {
         $users[$envUser] = $envHash;
     }
     return [
-        'cfg_file' => $cfgFile ?? (dirname(__DIR__) . '/config.php'),
+        'cfg_file' => $cfgFile ?? ($defaultBase . '/config.php'),
         'sqlite_dirs' => $cleanDirs,
+        'sqlite_allow_any_dir' => !empty($raw['sqlite_allow_any_dir']),
+        'sqlite_base_root' => isset($raw['sqlite_base_root']) && is_string($raw['sqlite_base_root']) ? rtrim($raw['sqlite_base_root'], '/\\') : $defaultBase,
         'sqlite_users' => $users,
         'max_login_attempts' => max(2, (int)($raw['max_login_attempts'] ?? 5)),
         'admin_lockout_seconds' => max(60, (int)($raw['admin_lockout_seconds'] ?? 900)),
@@ -124,7 +130,10 @@ function fandejo_config(): array {
 }
 
 function save_sqlite_config(array $dirs, array $users): void {
-    $cfgFile = is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (dirname(__DIR__) . '/config.php');
+    $envCfg = getenv('FANDEJO_CONFIG');
+    $cfgFile = ($envCfg && is_string($envCfg))
+        ? $envCfg
+        : (is_file(__DIR__ . '/../config.php') ? __DIR__ . '/../config.php' : (dirname(__DIR__) . '/config.php'));
     $existing = is_file($cfgFile) ? (require $cfgFile) : [];
     if (!is_array($existing)) $existing = [];
     $existing['sqlite_dirs'] = array_values($dirs);
@@ -138,6 +147,8 @@ function save_sqlite_config(array $dirs, array $users): void {
 
 /** Persistent brute-force & account lockout store (.fandejo_locks.json in project root, fallback to sys_get_temp_dir). */
 function locks_file_path(): string {
+    $envLocks = getenv('FANDEJO_LOCKS_FILE');
+    if ($envLocks && is_string($envLocks)) return $envLocks;
     $root = dirname(__DIR__);
     $p = $root . '/.fandejo_locks.json';
     if (is_file($p) || is_writable($root)) return $p;
@@ -446,13 +457,50 @@ function connect(array $c, ?string $db = null): PDO {
 
 function rows(PDO $p, string $sql, array $args = []): array { $s = $p->prepare($sql); $s->execute($args); return $s->fetchAll(); }
 
-function run_sql(PDO $p, string $sql): array {
+function format_byte_len(int $b): string {
+    return $b < 1024 ? "{$b} B" : ($b < 1048576 ? round($b / 1024, 1) . ' KB' : round($b / 1048576, 1) . ' MB');
+}
+
+function run_sql(PDO $p, string $sql, int $maxRows = 1000): array {
+    $maxRows = min(10000, max(10, $maxRows));
+    $maxCellBytes = 65536; // 64 KB cell display cap
     $t = microtime(true);
     $s = $p->query($sql);
     $res = ['ms' => round((microtime(true) - $t) * 1000, 2)];
-    if ($s->columnCount() > 0) {
-        $res['rows'] = $s->fetchAll(PDO::FETCH_ASSOC);
-        $res['columns'] = array_map(fn($i) => $s->getColumnMeta($i)['name'], range(0, $s->columnCount() - 1));
+    $colCount = $s->columnCount();
+    if ($colCount > 0) {
+        $cols = [];
+        for ($i = 0; $i < $colCount; $i++) {
+            $cols[] = $s->getColumnMeta($i)['name'] ?? "col_$i";
+        }
+        $rows = [];
+        $truncated = false;
+        while (($row = $s->fetch(PDO::FETCH_NUM)) !== false) {
+            if (count($rows) >= $maxRows) {
+                $truncated = true;
+                break;
+            }
+            $assoc = [];
+            foreach ($cols as $idx => $cn) {
+                $v = $row[$idx] ?? null;
+                if (is_string($v) && $v !== '') {
+                    $len = strlen($v);
+                    if (str_contains($v, "\0") || !preg_match('//u', $v)) {
+                        $hex = bin2hex(substr($v, 0, 16));
+                        $v = '[BLOB ' . format_byte_len($len) . ' · 0x' . $hex . ($len > 16 ? '…' : '') . ']';
+                    } elseif ($len > $maxCellBytes) {
+                        $v = substr($v, 0, $maxCellBytes) . ' … [truncated ' . format_byte_len($len) . ']';
+                    }
+                }
+                $assoc[$cn] = $v;
+            }
+            $rows[] = $assoc;
+        }
+        $s->closeCursor();
+        $res['rows'] = $rows;
+        $res['columns'] = $cols;
+        $res['truncated'] = $truncated;
+        $res['max_rows'] = $maxRows;
     } else {
         $res['affected'] = $s->rowCount();
     }
@@ -858,19 +906,36 @@ try {
                 'files' => $files,
             ];
         }
-        out(['dirs' => $out]);
+        out(['dirs' => $out, 'base_root' => realpath($cfg['sqlite_base_root']) ?: $cfg['sqlite_base_root'], 'allow_any_dir' => $cfg['sqlite_allow_any_dir']]);
 
     case 'set_sqlite_dirs':
         if ($drv !== 'sqlite') fail('SQLite mode only');
+        $cfg = fandejo_config();
         $rawDirs = $in['dirs'] ?? [];
         if (!is_array($rawDirs)) fail('Invalid directory list');
         $createMissing = !empty($in['create_missing']);
+        $allowedRoots = array_values(array_filter(array_unique(array_merge(
+            [realpath($cfg['sqlite_base_root']) ?: $cfg['sqlite_base_root']],
+            array_map(fn($d) => realpath($d) ?: $d, $cfg['sqlite_dirs'])
+        ))));
+        $forbiddenExact = ['/', '/etc', '/bin', '/sbin', '/usr', '/lib', '/lib64', '/proc', '/sys', '/dev', '/boot', '/root', realpath(__DIR__) ?: __DIR__];
         $clean = [];
         foreach ($rawDirs as $d) {
             $d = rtrim(trim((string)$d), '/\\');
             if ($d === '') continue;
-            if (str_contains($d, "\0")) fail('Invalid directory path');
-            if (!str_starts_with($d, '/')) fail("Directory path '$d' must be an absolute path (starting with /)");
+            if (str_contains($d, "\0") || preg_match('#(^|/)\.\.(/|$)#', $d)) fail('Invalid directory path (path traversal is not allowed)');
+            if (!str_starts_with($d, '/')) {
+                $d = ($allowedRoots[0] ?? dirname(__DIR__)) . '/' . ltrim($d, '/');
+            }
+            if (!$cfg['sqlite_allow_any_dir']) {
+                $underAllowed = false;
+                foreach ($allowedRoots as $root) {
+                    if ($d === $root || str_starts_with($d, rtrim($root, '/') . '/')) { $underAllowed = true; break; }
+                }
+                if (!$underAllowed) {
+                    fail("Directory '$d' is outside the allowed project sandbox ({$allowedRoots[0]}). Add external directories directly in config.php or set 'sqlite_allow_any_dir' => true.");
+                }
+            }
             if (!is_dir($d)) {
                 if ($createMissing) {
                     if (!@mkdir($d, 0750, true)) fail("Could not create directory '$d' — check filesystem permissions");
@@ -880,12 +945,19 @@ try {
             }
             $real = realpath($d);
             if ($real === false || !is_dir($real)) fail("Unable to resolve directory '$d'");
+            if (in_array($real, $forbiddenExact, true)) fail("Directory '$real' cannot be used as an SQLite data directory");
+            if (!$cfg['sqlite_allow_any_dir']) {
+                $realAllowed = false;
+                foreach ($allowedRoots as $root) {
+                    if ($real === $root || str_starts_with($real, rtrim($root, '/') . '/')) { $realAllowed = true; break; }
+                }
+                if (!$realAllowed) fail("Resolved directory '$real' is outside the allowed project sandbox");
+            }
             if (!is_readable($real)) fail("Directory '$real' is not readable by PHP user (" . get_current_user() . ")");
             $clean[] = $real;
         }
         $clean = array_values(array_unique($clean));
         if (!$clean) fail('At least one allowed SQLite directory is required');
-        $cfg = fandejo_config();
         save_sqlite_config($clean, $cfg['sqlite_users']);
         out(['ok' => true, 'dirs' => $clean]);
     case 'server_info':
@@ -1260,8 +1332,9 @@ try {
             $buf .= $ch;
         }
         if (trim($buf) !== '') $stmts[] = $buf;
+        $maxRows = (int)($in['max_rows'] ?? 1000);
         foreach ($stmts as $st) {
-            try { $r = run_sql($p, $st); $r['sql'] = trim($st); $results[] = $r; }
+            try { $r = run_sql($p, $st, $maxRows); $r['sql'] = trim($st); $results[] = $r; }
             catch (Throwable $e) { $results[] = ['sql' => trim($st), 'error' => $e->getMessage()]; break; }
         }
         out(['results' => $results]);
@@ -1487,23 +1560,106 @@ try {
         out(['ok' => true, 'imported' => $done, 'received' => count($irows)]);
 
     case 'export':
+    case 'export_sql':
         $tables = $in['tables'] ?? [];
-        $sql = "-- Fandejo SQL Export\n-- " . date('c') . "\n\n";
+        $wantStruct = !empty($in['structure']);
+        $wantData = !empty($in['data']);
+        $stream = ($a === 'export_sql') || !empty($in['stream']);
+        if ($stream) {
+            header_remove('Content-Type');
+            header('Content-Type: application/sql; charset=utf-8');
+            $fname = preg_replace('/[^\w.-]+/', '_', (string)($tb ?: ($db ?: 'fandejo'))) . '.sql';
+            header('Content-Disposition: attachment; filename="' . $fname . '"');
+            $fh = fopen('php://output', 'w');
+            $emit = function (string $chunk) use ($fh): void { fwrite($fh, $chunk); };
+        } else {
+            $buf = '';
+            $emit = function (string $chunk) use (&$buf): void { $buf .= $chunk; };
+        }
+
+        $emit("-- Fandejo SQL Export\n-- Engine: $drv | Database: " . ($db ?? 'main') . "\n-- Generated: " . date('c') . "\n\n");
+        $emit($drv === 'mysql' ? "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n" : "PRAGMA foreign_keys=OFF;\n\n");
+
+        $viewsQueue = [];
         foreach ($tables as $t) {
-            $TT = ($drv === 'mysql' ? q((string)$db, $drv) . '.' : '') . q($t, $drv);
-            if ($drv === 'mysql') $create = rows($p, "SHOW CREATE TABLE $TT")[0]['Create Table'] ?? '';
-            else $create = $p->query('SELECT sql FROM sqlite_master WHERE name=' . $p->quote($t))->fetchColumn();
-            if (!empty($in['structure'])) $sql .= "DROP TABLE IF EXISTS $TT;\n$create;\n\n";
-            if (!empty($in['data'])) {
-                $s = $p->query("SELECT * FROM $TT");
-                while ($r = $s->fetch(PDO::FETCH_ASSOC)) {
-                    $vals = array_map(fn($v) => $v === null ? 'NULL' : $p->quote((string)$v), array_values($r));
-                    $sql .= "INSERT INTO $TT (" . implode(',', array_map(fn($k) => q($k, $drv), array_keys($r))) . ') VALUES (' . implode(',', $vals) . ");\n";
+            $TT = ($drv === 'mysql' ? q((string)$db, $drv) . '.' : '') . q((string)$t, $drv);
+            $isV = false;
+            $create = '';
+            if ($drv === 'mysql') {
+                $rowC = rows($p, "SHOW CREATE TABLE $TT")[0] ?? [];
+                if (isset($rowC['Create View'])) {
+                    $isV = true;
+                    $create = $rowC['Create View'];
+                } else {
+                    $create = $rowC['Create Table'] ?? '';
                 }
-                $sql .= "\n";
+            } else {
+                $meta = rows($p, 'SELECT type, sql FROM sqlite_master WHERE name=?', [(string)$t])[0] ?? [];
+                $isV = strtolower((string)($meta['type'] ?? '')) === 'view';
+                $create = (string)($meta['sql'] ?? '');
+            }
+
+            if ($isV) {
+                if ($wantStruct && $create !== '') {
+                    $viewsQueue[] = "-- View: $t\nDROP VIEW IF EXISTS $TT;\n$create;\n\n";
+                }
+                continue; // Do not export row data for views
+            }
+
+            $blobCols = [];
+            if ($wantData) {
+                $rawCols = rows($p, $drv === 'sqlite' ? 'PRAGMA table_info(' . q((string)$t, $drv) . ')' : "SHOW COLUMNS FROM $TT");
+                foreach ($rawCols as $rc) {
+                    $cn = $drv === 'sqlite' ? $rc['name'] : $rc['Field'];
+                    $ct = strtoupper((string)($drv === 'sqlite' ? $rc['type'] : $rc['Type']));
+                    if (str_contains($ct, 'BLOB') || str_contains($ct, 'BINARY')) $blobCols[$cn] = true;
+                }
+            }
+
+            if ($wantStruct && $create !== '') {
+                $emit("-- Table structure for $t\nDROP TABLE IF EXISTS $TT;\n$create;\n\n");
+            }
+            if ($wantData) {
+                if ($drv === 'mysql') $p->setAttribute(defined('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') ? constant('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') : 1000, false);
+                $s = $p->query("SELECT * FROM $TT");
+                $batch = [];
+                $colHeader = '';
+                while ($r = $s->fetch(PDO::FETCH_ASSOC)) {
+                    if ($colHeader === '') {
+                        $colHeader = "INSERT INTO $TT (" . implode(',', array_map(fn($k) => q((string)$k, $drv), array_keys($r))) . ") VALUES\n";
+                    }
+                    $vals = [];
+                    foreach ($r as $cn => $v) {
+                        if ($v === null) {
+                            $vals[] = 'NULL';
+                        } elseif (isset($blobCols[$cn]) || (str_contains((string)$v, "\0") || !preg_match('//u', (string)$v))) {
+                            $hex = bin2hex((string)$v);
+                            $vals[] = $drv === 'sqlite' ? "X'$hex'" : ($hex === '' ? "''" : "0x$hex");
+                        } else {
+                            $vals[] = $p->quote((string)$v);
+                        }
+                    }
+                    $batch[] = '(' . implode(',', $vals) . ')';
+                    if (count($batch) >= 250) {
+                        $emit($colHeader . implode(",\n", $batch) . ";\n");
+                        $batch = [];
+                    }
+                }
+                if ($batch) {
+                    $emit($colHeader . implode(",\n", $batch) . ";\n");
+                }
+                if ($colHeader !== '') $emit("\n");
+                if ($drv === 'mysql') $p->setAttribute(defined('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') ? constant('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') : 1000, true);
             }
         }
-        out(['sql' => $sql]);
+        foreach ($viewsQueue as $vSql) $emit($vSql);
+        $emit($drv === 'mysql' ? "SET FOREIGN_KEY_CHECKS=1;\n" : "PRAGMA foreign_keys=ON;\n");
+
+        if ($stream) {
+            fclose($fh);
+            exit;
+        }
+        out(['sql' => $buf]);
 
     case 'users':
         $isAdmin = is_full_admin($p, $drv, $c);

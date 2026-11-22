@@ -16,6 +16,11 @@ return [
         __DIR__ . '/data',
     ],
 
+    // By default, any SQLite directory added through the web UI must reside inside
+    // the project directory (or an already-configured sqlite_dirs root).
+    // Set 'sqlite_allow_any_dir' => true to allow admins to add arbitrary server paths via the UI.
+    'sqlite_allow_any_dir' => false,
+
     // SQLite accounts: map of username => Argon2id/Bcrypt password_hash().
     // Generate a hash on the CLI with:
     //   php -r 'echo password_hash("your-secret-password", PASSWORD_ARGON2ID) . PHP_EOL;'
