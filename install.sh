@@ -364,8 +364,8 @@ fi
 
 # Set secure ownership and permissions:
 # - public/ is world-readable (0755 dirs, 0644 files) so the web server can serve static assets
-# - data/ is owned by $WEB_USER (0750) so SQLite can create WAL/SHM journal files
-# - config.php & .fandejo_locks.json are 0600 owned by $WEB_USER
+# - data/ is owned by $WEB_USER (0750) so SQLite and lockouts are reliably writable
+# - config.php & .fandejo_locks.json are owned by $WEB_USER
 chown -R root:"$WEB_USER" "$INSTALL_DIR"
 chmod 0755 "$INSTALL_DIR" "$INSTALL_DIR/public"
 chmod 0644 "$INSTALL_DIR/public/"*
@@ -375,6 +375,8 @@ chmod 0750 "$INSTALL_DIR/data"
 
 if [[ "$ACTION" == "update" ]]; then
     [[ -f "$INSTALL_DIR/config.php" ]] && chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/config.php" && chmod 0600 "$INSTALL_DIR/config.php"
+    [[ -f "$INSTALL_DIR/.fandejo_locks.json" ]] && chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/.fandejo_locks.json" && chmod 0660 "$INSTALL_DIR/.fandejo_locks.json"
+    [[ -f "$INSTALL_DIR/data/.fandejo_locks.json" ]] && chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/data/.fandejo_locks.json" && chmod 0660 "$INSTALL_DIR/data/.fandejo_locks.json"
     chmod 0775 "$INSTALL_DIR"
     ok "Updated Fandejo to $NEW_VER in $INSTALL_DIR/public (preserved config.php and data/)."
     exit 0
@@ -423,6 +425,8 @@ fi
 
 chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/config.php"
 chmod 0600 "$INSTALL_DIR/config.php"
+[[ -f "$INSTALL_DIR/.fandejo_locks.json" ]] && chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/.fandejo_locks.json" && chmod 0660 "$INSTALL_DIR/.fandejo_locks.json"
+[[ -f "$INSTALL_DIR/data/.fandejo_locks.json" ]] && chown "$WEB_USER":"$WEB_USER" "$INSTALL_DIR/data/.fandejo_locks.json" && chmod 0660 "$INSTALL_DIR/data/.fandejo_locks.json"
 # Ensure $INSTALL_DIR is group-writable by $WEB_USER so api.php can create/update config.php and .fandejo_locks.json
 chmod 0775 "$INSTALL_DIR"
 

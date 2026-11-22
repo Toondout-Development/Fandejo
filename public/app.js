@@ -37,7 +37,7 @@ function engineSelectOpts(sel) {
     return list.map(e => `<option value="${esc(e)}" ${e === sel ? 'selected' : ''}>${esc(e)}</option>`).join('');
 }
 
-const S = { version: 'v1.0.1', driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, fkBack: [], sql: '' };
+const S = { version: 'v1.0.2', driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, fkBack: [], sql: '' };
 
 function showLicenseModal() {
     modal(`<div style="width:min(580px,85vw)"><h3>Fandejo ${esc(S.version)} — License & Attribution</h3>

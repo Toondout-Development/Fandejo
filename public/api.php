@@ -4,6 +4,7 @@ if (PHP_SAPI === 'cli' && isset($argv[1]) && str_starts_with($argv[1], '--unlock
     $target = str_contains($argv[1], '=') ? trim(substr($argv[1], strpos($argv[1], '=') + 1)) : ($argv[2] ?? '');
     $root = dirname(__DIR__);
     $files = array_filter([
+        $root . '/data/.fandejo_locks.json',
         $root . '/.fandejo_locks.json',
         sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json',
     ], 'is_file');
@@ -21,6 +22,7 @@ if (PHP_SAPI === 'cli' && isset($argv[1]) && str_starts_with($argv[1], '--unlock
             }
             if (isset($data['ips'][$target])) { unset($data['ips'][$target]); $removed++; }
             @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+            @chmod($f, 0660);
             echo "Unlocked '$target' ($removed entry removed from $f).\n";
         }
     }
@@ -95,7 +97,7 @@ function fandejo_version(): string {
         $v = trim((string)@file_get_contents($vf));
         if ($v !== '') return $v;
     }
-    return 'v1.0.1';
+    return 'v1.0.2';
 }
 
 /** Load config.php (from project root or public/, or FANDEJO_CONFIG env var) combined with sensible defaults. */
@@ -159,20 +161,37 @@ function save_sqlite_config(array $dirs, array $users): void {
     @chmod($cfgFile, 0600);
 }
 
-/** Persistent brute-force & account lockout store (.fandejo_locks.json in project root, fallback to sys_get_temp_dir). */
+/** Persistent brute-force & account lockout store (prefers data/.fandejo_locks.json, root/.fandejo_locks.json, fallback to sys_get_temp_dir). */
 function locks_file_path(): string {
     $envLocks = getenv('FANDEJO_LOCKS_FILE');
     if ($envLocks && is_string($envLocks)) return $envLocks;
     $root = dirname(__DIR__);
-    $p = $root . '/.fandejo_locks.json';
-    if (is_file($p) || is_writable($root)) return $p;
+    $dataFile = $root . '/data/.fandejo_locks.json';
+    $rootFile = $root . '/.fandejo_locks.json';
+
+    // 1. Existing writable files
+    if (is_file($dataFile) && is_writable($dataFile)) return $dataFile;
+    if (is_file($rootFile) && is_writable($rootFile)) return $rootFile;
+
+    // 2. Directories where a new file can be created
+    if (is_dir($root . '/data') && is_writable($root . '/data')) return $dataFile;
+    if (is_writable($root)) return $rootFile;
+
+    // 3. Fallback to existing files even if not currently writable by current user
+    if (is_file($dataFile)) return $dataFile;
+    if (is_file($rootFile)) return $rootFile;
+
     return sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json';
 }
 function load_locks(): array {
     $f = locks_file_path();
-    if (!is_file($f)) return ['accounts' => [], 'ips' => []];
-    $raw = @file_get_contents($f);
-    $data = $raw ? json_decode($raw, true) : null;
+    $raw = is_file($f) ? @file_get_contents($f) : false;
+    if ($raw === false) {
+        $tempF = sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json';
+        if (is_file($tempF)) $raw = @file_get_contents($tempF);
+    }
+    if (!is_string($raw) || $raw === '') return ['accounts' => [], 'ips' => []];
+    $data = json_decode($raw, true);
     if (!is_array($data)) return ['accounts' => [], 'ips' => []];
     // Normalize legacy account entries without by_ip map
     $accts = [];
@@ -194,8 +213,13 @@ function load_locks(): array {
 }
 function save_locks(array $data): void {
     $f = locks_file_path();
-    @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
-    @chmod($f, 0600);
+    $written = @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+    if ($written === false) {
+        // Fallback to temp directory if primary location permission was denied
+        $f = sys_get_temp_dir() . '/fandejo_locks_' . substr(hash('sha256', __FILE__), 0, 12) . '.json';
+        @file_put_contents($f, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+    }
+    @chmod($f, 0660);
 }
 function recompute_acct_lock_summary(array &$acct): void {
     $byIp = $acct['by_ip'] ?? [];
