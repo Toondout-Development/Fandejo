@@ -215,23 +215,31 @@ async function tablesView() {
 async function browse() {
     const B = S.browse, r = await api('browse', { db: S.db, table: S.table, ...B });
     const pages = Math.max(1, Math.ceil(r.total / r.per));
-    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:260px"><span class="badge">${r.total} rows</span><button id="bcsv" title="Download the current search and sort as CSV">⬇ CSV</button><span class="spacer"></span>
+    const keyCols = r.key_cols?.length ? r.key_cols : r.pk;
+    const canEdit = !r.is_view && keyCols.length > 0;
+    const uk = r.uk || [];
+    const noKeyNotice = r.key_type === 'all' ? `<span class="badge warn" title="This table has no PRIMARY or UNIQUE key. Edits and deletes match all column values${S.driver === 'mysql' ? ' (with LIMIT 1)' : ''}.">⚠ No PK (full-row match)</span>` : '';
+    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:260px"><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search and sort as CSV">⬇ CSV</button><span class="spacer"></span>
       <button id="pp" ${B.page <= 1 ? 'disabled' : ''}>‹</button><span>Page ${r.page} / ${pages}</span><button id="np" ${B.page >= pages ? 'disabled' : ''}>›</button>
       <select id="per">${[25, 50, 100, 250].map(n => `<option ${n === r.per ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
-      <div class="tw"><table><tr><th></th>${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk">🔑</span> ' : ''}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
-      ${r.rows.map((row, i) => `<tr><td class="act"><button class="ghost" data-e="${i}">✎</button><button class="ghost danger" data-x="${i}">🗑</button></td>${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
+      <div class="tw"><table><tr>${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
+      ${r.rows.map((row, i) => `<tr>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
       ${r.rows.length ? '' : '<div class="empty">No rows</div>'}`;
     $('#bs').onkeydown = e => { if (e.key === 'Enter') { B.search = e.target.value; B.page = 1; render(); } };
     $('#bcsv').onclick = guard(() => exportCSV({ table: S.table, search: B.search, sort: B.sort, dir: B.dir, header: true, delimiter: ',' }));
     $('#pp').onclick = () => { B.page--; render(); }; $('#np').onclick = () => { B.page++; render(); };
     $('#per').onchange = e => { B.per = +e.target.value; B.page = 1; render(); };
     C().querySelectorAll('th[data-c]').forEach(th => th.onclick = () => { B.dir = B.sort === th.dataset.c && B.dir === 'asc' ? 'desc' : 'asc'; B.sort = th.dataset.c; render(); });
-    const keyOf = row => Object.fromEntries(r.pk.map(k => [k, row[k]]));
-    C().querySelectorAll('[data-x]').forEach(b => b.onclick = () => confirmDo('Delete this row?', async () => { await api('delete', { db: S.db, table: S.table, key: keyOf(r.rows[b.dataset.x]) }); render(); }));
+    const keyOf = row => {
+        const useAll = r.key_type === 'all' || (r.key_type === 'unique' && keyCols.some(k => row[k] === null));
+        return Object.fromEntries((useAll ? r.columns : keyCols).map(k => [k, row[k]]));
+    };
+    C().querySelectorAll('[data-x]').forEach(b => b.onclick = () => confirmDo(r.key_type === 'all' ? 'Delete this row? (Table has no primary/unique key — matching all column values)' : 'Delete this row?', async () => { await api('delete', { db: S.db, table: S.table, key: keyOf(r.rows[b.dataset.x]) }); render(); }));
     C().querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
         const row = r.rows[b.dataset.e];
         const meta = r.col_meta || {};
-        modal(`<div style="width:min(600px,80vw)"><h3>Edit row</h3>${r.columns.map(c => renderFieldInput(c, meta[c] || { base: 'VARCHAR' }, row[c], false)).join('')}</div>`, async f => {
+        const warnHtml = r.key_type === 'all' ? `<div class="msg" style="margin-top:0">This table has no primary or unique key; matching row by all current column values${S.driver === 'mysql' ? ' (<code>LIMIT 1</code>)' : ''}.</div>` : '';
+        modal(`<div style="width:min(600px,80vw)"><h3>Edit row</h3>${warnHtml}${r.columns.map(c => renderFieldInput(c, meta[c] || { base: 'VARCHAR' }, row[c], false)).join('')}</div>`, async f => {
             const values = {};
             r.columns.forEach(c => {
                 const base = (meta[c]?.base || '').toUpperCase();

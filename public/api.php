@@ -836,7 +836,9 @@ try {
 
     case 'browse':
         $page = max(1, (int)($in['page'] ?? 1)); $per = min(500, max(5, (int)($in['per'] ?? 50)));
-        $isView = $drv === 'sqlite' && strtolower((string)$p->query("SELECT type FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn()) === 'view';
+        $isView = $drv === 'sqlite'
+            ? strtolower((string)$p->query("SELECT type FROM sqlite_master WHERE name=" . $p->quote((string)$tb))->fetchColumn()) === 'view'
+            : stripos((string)(rows($p, "SELECT TABLE_TYPE t FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", [$db, $tb])[0]['t'] ?? ''), 'VIEW') !== false;
         $rawCols = rows($p, $drv === 'sqlite' ? 'PRAGMA table_info(' . q($tb, $drv) . ')' : "SHOW COLUMNS FROM $T");
         $cols = array_column($rawCols, $drv === 'sqlite' ? 'name' : 'Field');
         $colMeta = [];
@@ -855,22 +857,57 @@ try {
         if (!empty($in['sort']) && in_array($in['sort'], $cols, true)) $order = ' ORDER BY ' . q($in['sort'], $drv) . (($in['dir'] ?? '') === 'desc' ? ' DESC' : ' ASC');
         $total = (int)rows($p, "SELECT COUNT(*) n FROM $T$where", $args)[0]['n'];
         $pk = [];
+        $uk = [];
+        $keyCols = [];
+        $keyType = 'none';
         $useRowid = false;
         if ($drv === 'sqlite') {
             foreach ($rawCols as $x) if ($x['pk']) $pk[] = $x['name'];
-            if (!$pk && !$isView) {
+            if ($pk) {
+                $keyCols = $pk;
+                $keyType = 'pk';
+            } elseif (!$isView) {
                 try {
                     $p->query("SELECT rowid FROM $T LIMIT 1");
-                    $pk = ['__rowid__'];
+                    $keyCols = ['__rowid__'];
+                    $keyType = 'rowid';
                     $useRowid = true;
-                } catch (Throwable) {}
+                } catch (Throwable) {
+                    foreach (list_indexes($p, $drv, $T, $tb) as $ix) {
+                        if ($ix['type'] === 'UNIQUE' && $ix['columns']) {
+                            $uk = array_column($ix['columns'], 'name');
+                            break;
+                        }
+                    }
+                    $keyCols = $uk ?: $cols;
+                    $keyType = $uk ? 'unique' : 'all';
+                }
             }
         } else {
             foreach ($rawCols as $x) if ($x['Key'] === 'PRI') $pk[] = $x['Field'];
+            if ($pk) {
+                $keyCols = $pk;
+                $keyType = 'pk';
+            } elseif (!$isView) {
+                $uIdx = [];
+                foreach (rows($p, "SHOW INDEX FROM $T") as $ix) {
+                    if (!$ix['Non_unique'] && $ix['Key_name'] !== 'PRIMARY' && empty($ix['Sub_part'])) {
+                        $uIdx[$ix['Key_name']][] = $ix['Column_name'];
+                    }
+                }
+                foreach ($uIdx as $uCols) {
+                    $allNotNull = true;
+                    foreach ($uCols as $uc) if (!empty($colMeta[$uc]['null'])) { $allNotNull = false; break; }
+                    if ($allNotNull) { $uk = $uCols; break; }
+                }
+                if (!$uk && $uIdx) $uk = reset($uIdx);
+                $keyCols = $uk ?: $cols;
+                $keyType = $uk ? 'unique' : 'all';
+            }
         }
         $selCols = $useRowid ? 'rowid AS "__rowid__", *' : '*';
         $data = rows($p, "SELECT $selCols FROM $T$where$order LIMIT $per OFFSET " . (($page - 1) * $per), $args);
-        out(['rows' => $data, 'columns' => $cols, 'col_meta' => $colMeta, 'total' => $total, 'pk' => $pk, 'page' => $page, 'per' => $per]);
+        out(['rows' => $data, 'columns' => $cols, 'col_meta' => $colMeta, 'total' => $total, 'pk' => $pk, 'uk' => $uk, 'key_cols' => $keyCols, 'key_type' => $keyType, 'is_view' => $isView, 'page' => $page, 'per' => $per]);
 
     case 'insert':
         $v = $in['values'] ?? [];
@@ -882,7 +919,7 @@ try {
     case 'update':
     case 'delete':
         $key = $in['key'] ?? [];
-        if (!$key) fail('Table has no primary key; use the SQL editor');
+        if (!$key || !is_array($key)) fail('Row identifier key is required');
         $w = []; $args = [];
         foreach ($key as $k => $val) {
             $colSql = ($drv === 'sqlite' && $k === '__rowid__') ? 'rowid' : q((string)$k, $drv);
@@ -890,10 +927,18 @@ try {
             else { $w[] = "$colSql = ?"; $args[] = $val; }
         }
         $w = implode(' AND ', $w);
-        if ($a === 'delete') { $s = $p->prepare("DELETE FROM $T WHERE $w" . ($drv === 'mysql' ? ' LIMIT 1' : '')); $s->execute($args); out(['ok' => true]); }
+        $limit = $drv === 'mysql' ? ' LIMIT 1' : '';
+        if ($a === 'delete') {
+            $s = $p->prepare("DELETE FROM $T WHERE $w$limit");
+            $s->execute($args);
+            out(['ok' => true, 'affected' => $s->rowCount()]);
+        }
         $v = $in['values'] ?? [];
+        if (!$v || !is_array($v)) fail('No column values provided for update');
         $set = implode(',', array_map(fn($k) => q($k, $drv) . ' = ?', array_keys($v)));
-        $s = $p->prepare("UPDATE $T SET $set WHERE $w"); $s->execute(array_merge(array_values($v), $args)); out(['ok' => true]);
+        $s = $p->prepare("UPDATE $T SET $set WHERE $w$limit");
+        $s->execute(array_merge(array_values($v), $args));
+        out(['ok' => true, 'affected' => $s->rowCount()]);
 
     case 'query':
         $results = [];
