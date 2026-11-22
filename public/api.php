@@ -1769,6 +1769,78 @@ try {
     case 'rename_table':
         $p->exec($drv === 'mysql' ? "RENAME TABLE $T TO " . q((string)$db, $drv) . '.' . q($in['to'], $drv) : "ALTER TABLE $T RENAME TO " . q($in['to'], $drv)); out(['ok' => true]);
 
+    case 'table_meta':
+        $nextAi = null;
+        if ($drv === 'mysql') {
+            $nextAi = rows($p, 'SELECT AUTO_INCREMENT ai FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?', [$db, $tb])[0]['ai'] ?? null;
+        } else {
+            try {
+                $seq = $p->query('SELECT seq FROM sqlite_sequence WHERE name=' . $p->quote((string)$tb))->fetchColumn();
+                if ($seq !== false) $nextAi = ((int)$seq) + 1;
+            } catch (Throwable) {}
+        }
+        out(['auto_increment' => $nextAi !== null ? (int)$nextAi : null]);
+
+    case 'table_maint':
+        $op = strtolower(trim((string)($in['op'] ?? '')));
+        if ($drv === 'mysql') {
+            $sqlMap = [
+                'check' => "CHECK TABLE $T",
+                'analyze' => "ANALYZE TABLE $T",
+                'optimize' => "OPTIMIZE TABLE $T",
+                'repair' => "REPAIR TABLE $T",
+            ];
+            if ($op === 'auto_increment') {
+                $val = max(1, (int)($in['value'] ?? 1));
+                $p->exec("ALTER TABLE $T AUTO_INCREMENT = $val");
+                out(['ok' => true, 'messages' => [['op' => 'AUTO_INCREMENT', 'type' => 'status', 'text' => "Next AUTO_INCREMENT set to $val"]]]);
+            }
+            if (!isset($sqlMap[$op])) fail("Unsupported MySQL maintenance operation '$op'");
+            $resRows = rows($p, $sqlMap[$op]);
+            $msgs = array_map(fn($r) => ['op' => $r['Op'] ?? strtoupper($op), 'type' => $r['Msg_type'] ?? 'status', 'text' => $r['Msg_text'] ?? 'OK'], $resRows);
+            out(['ok' => true, 'messages' => $msgs]);
+        } else {
+            if ($op === 'vacuum') {
+                $p->exec('VACUUM');
+                out(['ok' => true, 'messages' => [['op' => 'VACUUM', 'type' => 'status', 'text' => 'Database file rebuilt and compacted (VACUUM complete)']]]);
+            }
+            if ($op === 'analyze') {
+                $target = $T ?: '';
+                $p->exec('ANALYZE' . ($target ? " $target" : ''));
+                out(['ok' => true, 'messages' => [['op' => 'ANALYZE', 'type' => 'status', 'text' => 'Query planner statistics updated (ANALYZE complete)']]]);
+            }
+            if ($op === 'integrity_check') {
+                $res = array_column($p->query('PRAGMA integrity_check')->fetchAll(PDO::FETCH_NUM), 0);
+                out(['ok' => true, 'messages' => array_map(fn($m) => ['op' => 'integrity_check', 'type' => $m === 'ok' ? 'status' : 'error', 'text' => $m], $res)]);
+            }
+            if ($op === 'foreign_key_check') {
+                $res = rows($p, 'PRAGMA foreign_key_check' . ($T ? "($T)" : ''));
+                $msgs = $res ? array_map(fn($r) => ['op' => 'foreign_key_check', 'type' => 'error', 'text' => "Table {$r['table']} rowid {$r['rowid']} violates FK to {$r['parent']}"], $res)
+                             : [['op' => 'foreign_key_check', 'type' => 'status', 'text' => 'ok (no foreign key violations found)']];
+                out(['ok' => true, 'messages' => $msgs]);
+            }
+            if ($op === 'auto_increment') {
+                $val = max(0, ((int)($in['value'] ?? 1)) - 1);
+                $p->exec('UPDATE sqlite_sequence SET seq = ' . $val . ' WHERE name = ' . $p->quote((string)$tb));
+                out(['ok' => true, 'messages' => [['op' => 'sqlite_sequence', 'type' => 'status', 'text' => 'Next AUTOINCREMENT set to ' . ($val + 1)]]]);
+            }
+            fail("Unsupported SQLite maintenance operation '$op'");
+        }
+
+    case 'processlist':
+        if ($drv !== 'mysql') out(['processes' => [], 'supported' => false]);
+        $myId = (int)$p->query('SELECT CONNECTION_ID()')->fetchColumn();
+        $procs = rows($p, 'SHOW FULL PROCESSLIST');
+        out(['processes' => $procs, 'my_id' => $myId, 'supported' => true]);
+
+    case 'kill_process':
+        if ($drv !== 'mysql') fail('MySQL/MariaDB only');
+        $pid = (int)($in['id'] ?? 0);
+        if ($pid <= 0) fail('Invalid process ID');
+        $qOnly = !empty($in['query_only']) ? ' QUERY' : '';
+        $p->exec("KILL$qOnly $pid");
+        out(['ok' => true]);
+
     case 'create_table':
         // columns: [{name,type,length,null,pk,ai,default,default_mode,on_update}]
         $colsIn = array_values($in['columns'] ?? []);

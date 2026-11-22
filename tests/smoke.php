@@ -123,6 +123,11 @@ call('create_trigger', ['db' => $dbName, 'name' => 'trg_u_ins', 'table' => 'u', 
 $trList = call('triggers', ['db' => $dbName, 'table' => 'u']);
 if (count($trList['triggers'] ?? []) !== 1) { echo "  [FAIL] Expected 1 trigger on table u\n"; $failures++; }
 call('drop_trigger', ['db' => $dbName, 'name' => 'trg_u_ins']);
+call('table_meta', ['db' => $dbName, 'table' => 'u']);
+$tmRes = call('table_maint', ['db' => $dbName, 'table' => 'u', 'op' => 'integrity_check']);
+if (($tmRes['messages'][0]['text'] ?? '') !== 'ok') { echo "  [FAIL] Expected integrity_check ok\n"; $failures++; }
+call('table_maint', ['db' => $dbName, 'table' => 'u', 'op' => 'analyze']);
+call('table_maint', ['db' => $dbName, 'table' => 'u', 'op' => 'vacuum']);
 call('export_csv', ['db' => $dbName, 'table' => 'u', 'delimiter' => ',', 'header' => true, 'null_as' => 'NULL']);
 call('server_info');
 

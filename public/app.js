@@ -193,11 +193,11 @@ function render() {
     if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.fkBack = []; S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
         : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['routines', S.driver === 'mysql' ? 'Views / Routines / Triggers' : 'Views & Triggers'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
-            : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL'], ['export', 'Export DB'], ['import', 'Import DB']];
+            : [['home', 'Dashboard'], ...(S.driver === 'mysql' ? [['processes', 'Processes']] : []), ['users', 'Users'], ['sql', 'SQL'], ['export', 'Export DB'], ['import', 'Import DB']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
     $('#tabs').querySelectorAll('.tab').forEach(t => t.onclick = () => { S.tab = t.dataset.k; render(); });
-    const view = { home: dbsHome, browse, structure, sql: sqlView, insert: insertView, ops, tables: tablesView, newtable: newTable, routines: dbObjectsView, export: exportView, import: importView, dropdb, users }[S.tab];
+    const view = { home: dbsHome, processes: processesView, browse, structure, sql: sqlView, insert: insertView, ops, tables: tablesView, newtable: newTable, routines: dbObjectsView, export: exportView, import: importView, dropdb, users }[S.tab];
     guard(view)();
 }
 const C = () => $('#content');
@@ -1336,12 +1336,14 @@ async function ops() {
     const curEng = tbObj.engine || getPrefs().engine;
     const curColl = tbObj.collation || getPrefs().collation;
     const curCmt = tbObj.comment || '';
+    const tMeta = await api('table_meta', { db: S.db, table: S.table }).catch(() => ({ auto_increment: null }));
 
-    C().innerHTML = `<div class="dash-grid" style="max-width:960px">
+    C().innerHTML = `<div class="dash-grid" style="max-width:1020px">
       <div class="dash-card">
         <h3>⚙ Table Options</h3>
         <div class="form">
           <label>Rename table<div class="row"><input id="rn" value="${esc(S.table)}" style="flex:1"><button id="rb">Rename</button></div></label>
+          ${tMeta.auto_increment !== null ? `<label>Next AUTO_INCREMENT value<div class="row"><input type="number" min="1" id="t-ai" value="${tMeta.auto_increment}" style="flex:1"><button id="t-aib">Set AUTO_INCREMENT</button></div></label>` : ''}
           ${my ? `<label>Storage Engine<select id="t-eng">${engineSelectOpts(curEng)}</select></label>
           <label>Table Charset & Collation<select id="t-coll">${collSelectOpts(curColl)}</select></label>
           <label>Column Conversion Strategy<select id="t-cmode">
@@ -1354,10 +1356,25 @@ async function ops() {
           <div><button class="primary" id="t-save">Save Table Options</button></div>` : ''}
         </div>
       </div>
+
       <div class="dash-card">
-        <h3>⚠ Danger Zone</h3>
+        <h3>🛠 Table Maintenance & Diagnostics</h3>
+        <p style="color:var(--mute);font-size:12px;margin-top:0">${my ? 'Verify table integrity, refresh index cardinality statistics, or defragment data files.' : 'Check SQLite integrity, verify foreign key constraints, update planner statistics, or compact the database file.'}</p>
+        <div class="bar">
+          ${my ? `<button data-maint="check">🔍 Check Table</button>
+            <button data-maint="analyze">📊 Analyze Table</button>
+            <button data-maint="optimize">⚡ Optimize Table</button>
+            <button data-maint="repair">🔧 Repair Table</button>`
+          : `<button data-maint="integrity_check">🔍 Integrity Check</button>
+            <button data-maint="foreign_key_check">🔗 Foreign Key Check</button>
+            <button data-maint="analyze">📊 Analyze Statistics</button>
+            <button data-maint="vacuum">⚡ Vacuum Database</button>`}
+        </div>
+        <div id="maint-res"></div>
+
+        <h3 style="margin-top:20px">⚠ Danger Zone</h3>
         <p style="color:var(--mute);font-size:12px">Destructive actions on <b>${esc(S.table)}</b>. These cannot be undone.</p>
-        <div class="form">
+        <div class="bar" style="margin-bottom:0">
           <button id="tr" class="danger">Empty table (TRUNCATE)</button>
           <button id="dr" class="danger">Drop table permanently</button>
         </div>
@@ -1365,6 +1382,21 @@ async function ops() {
     </div>`;
 
     $('#rb').onclick = guard(async () => { const to = $('#rn').value; await api('rename_table', { db: S.db, table: S.table, to }); S.table = to; await loadTables(S.db); render(); });
+    if ($('#t-aib')) {
+        $('#t-aib').onclick = guard(async () => {
+            const val = +$('#t-ai').value;
+            const res = await api('table_maint', { db: S.db, table: S.table, op: 'auto_increment', value: val });
+            toast(res.messages?.[0]?.text || 'AUTO_INCREMENT updated');
+            render();
+        });
+    }
+    C().querySelectorAll('[data-maint]').forEach(b => b.onclick = guard(async () => {
+        const op = b.dataset.maint;
+        $('#maint-res').innerHTML = `<div class="msg">Running <code>${esc(op.toUpperCase())}</code>…</div>`;
+        const res = await api('table_maint', { db: S.db, table: S.table, op });
+        $('#maint-res').innerHTML = (res.messages || []).map(m => `<div class="msg ${m.type === 'error' ? 'err' : 'ok'}"><b>${esc(m.op)}</b> (${esc(m.type)}): ${esc(m.text)}</div>`).join('');
+        if (op === 'vacuum' || op === 'optimize') { await loadDbs(); await loadTables(S.db); }
+    }));
     $('#tr').onclick = () => confirmDo('Delete ALL rows?', async () => { await api('truncate', { db: S.db, table: S.table }); toast('Table emptied'); });
     $('#dr').onclick = () => confirmDo('Drop this table?', async () => { await api('drop_table', { db: S.db, table: S.table }); S.table = null; await loadTables(S.db); S.tab = 'tables'; render(); });
 
@@ -1692,6 +1724,13 @@ async function dropdb() {
             <div class="kv"><span>Sandbox Path</span><b><code style="font-size:12px;word-break:break-all">${esc(dbObj.path || S.db)}</code></b></div>
             <div class="kv"><span>File Size</span><b>${fmtSize(dbObj.size)}</b></div>
             <div class="kv"><span>Tables & Views</span><b>${dbObj.tables ?? (S.tables[S.db] || []).length}</b></div>
+            <div class="bar" style="margin-top:12px;margin-bottom:0">
+              <button data-dbm="integrity_check">🔍 Integrity Check</button>
+              <button data-dbm="foreign_key_check">🔗 FK Check</button>
+              <button data-dbm="analyze">📊 Analyze</button>
+              <button data-dbm="vacuum" class="primary">⚡ Vacuum & Compact</button>
+            </div>
+            <div id="dbm-res"></div>
           </div>
           <div class="dash-card">
             <h3>⚠ Danger Zone</h3>
@@ -1699,6 +1738,13 @@ async function dropdb() {
             <button class="danger" id="dd">Delete SQLite file ${esc(S.db)}</button>
           </div>
         </div>`;
+        C().querySelectorAll('[data-dbm]').forEach(b => b.onclick = guard(async () => {
+            const op = b.dataset.dbm;
+            $('#dbm-res').innerHTML = `<div class="msg">Running <code>${esc(op.toUpperCase())}</code>…</div>`;
+            const res = await api('table_maint', { db: S.db, op });
+            $('#dbm-res').innerHTML = (res.messages || []).map(m => `<div class="msg ${m.type === 'error' ? 'err' : 'ok'}"><b>${esc(m.op)}</b>: ${esc(m.text)}</div>`).join('');
+            if (op === 'vacuum') await loadDbs();
+        }));
         $('#dd').onclick = () => confirmDo(`Permanently delete SQLite database file ${S.db}?`, async () => { await api('drop_db', { db: S.db }); S.db = null; await loadDbs(); layout(); toast('SQLite database deleted'); });
         return;
     }
@@ -1948,6 +1994,49 @@ function fmtUptime(sec) {
     return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
 }
 
+async function processesView() {
+    if (S.driver !== 'mysql') { C().innerHTML = '<div class="empty">Live processlist is available for MySQL / MariaDB only.</div>'; return; }
+    const r = await api('processlist');
+    const procs = r.processes || [];
+    const hideSleep = !!S.hideSleepProcs;
+    const shown = procs.filter(p => !hideSleep || (p.Command || '').toLowerCase() !== 'sleep');
+    C().innerHTML = `<div class="bar">
+      <h3 style="margin:0">⚡ Live Server Processlist (${shown.length} / ${procs.length} threads)</h3>
+      <label class="pc" style="margin-left:12px;padding:4px 10px"><input type="checkbox" id="pl-sleep" ${hideSleep ? 'checked' : ''}><span>Hide Sleeping connections</span></label>
+      <span class="spacer"></span>
+      <button class="primary" id="pl-ref">↻ Refresh</button>
+    </div>
+    <div class="tw"><table>
+      <tr><th>ID</th><th>User</th><th>Host</th><th>Database</th><th>Command</th><th>Time (s)</th><th>State</th><th>Query / Info</th><th></th></tr>
+      ${shown.map(p => {
+          const isMe = +p.Id === +r.my_id;
+          return `<tr>
+            <td><b>${esc(p.Id)}</b>${isMe ? ' <span class="badge">you</span>' : ''}</td>
+            <td>${esc(p.User)}</td>
+            <td><code>${esc(p.Host)}</code></td>
+            <td>${esc(p.db || '–')}</td>
+            <td><span class="badge ${(p.Command || '') === 'Query' ? 'warn' : ''}">${esc(p.Command)}</span></td>
+            <td>${esc(p.Time)}</td>
+            <td><small>${esc(p.State || '–')}</small></td>
+            <td title="${esc(p.Info || '')}"><code>${esc(p.Info || '–')}</code></td>
+            <td class="act">${!isMe ? `<button class="ghost" data-kq="${p.Id}" title="Cancel running query only (KILL QUERY)">⏹ Stop Query</button><button class="ghost danger" data-kp="${p.Id}" title="Disconnect thread (KILL CONNECTION)">✕ Kill</button>` : ''}</td>
+          </tr>`;
+      }).join('')}
+    </table></div>`;
+    $('#pl-ref').onclick = () => processesView();
+    $('#pl-sleep').onchange = e => { S.hideSleepProcs = e.target.checked; processesView(); };
+    C().querySelectorAll('[data-kq]').forEach(b => b.onclick = () => confirmDo(`Stop running query on thread #${b.dataset.kq} (KILL QUERY)?`, async () => {
+        await api('kill_process', { id: +b.dataset.kq, query_only: true });
+        toast(`Stopped query on #${b.dataset.kq}`);
+        processesView();
+    }));
+    C().querySelectorAll('[data-kp]').forEach(b => b.onclick = () => confirmDo(`Terminate connection #${b.dataset.kp} (KILL)?`, async () => {
+        await api('kill_process', { id: +b.dataset.kp });
+        toast(`Killed connection #${b.dataset.kp}`);
+        processesView();
+    }));
+}
+
 async function dbsHome() {
     const info = await api('server_info');
     const my = S.driver === 'mysql';
@@ -2006,7 +2095,7 @@ async function dbsHome() {
           ${info.version_comment ? `<div class="kv"><span>Distribution</span><b>${esc(info.version_comment)}</b></div>` : ''}
           <div class="kv"><span>${my ? 'Host & Port' : 'Sandbox Directories'}</span><b><code style="font-size:12px;word-break:break-all">${esc(info.host)}</code></b></div>
           <div class="kv"><span>Server Charset</span><b>${esc(info.charset)}</b></div>
-          ${my ? `<div class="kv"><span>Active Threads / Max</span><b>${info.threads} / ${info.max_connections}</b></div>
+          ${my ? `<div class="kv"><span>Active Threads / Max</span><b>${info.threads} / ${info.max_connections} <a href="#" id="d-pl" class="crumb" style="margin-left:6px">View Processes →</a></b></div>
           <div class="kv"><span>Total Queries / Slow</span><b>${Number(info.questions).toLocaleString()} (${info.slow_queries} slow)</b></div>
           ${info.socket ? `<div class="kv"><span>Socket</span><b>${esc(info.socket)}</b></div>` : ''}`
           : `<div class="kv"><span>Journal Mode</span><b>${esc(info.journal_mode)}</b></div>
@@ -2090,6 +2179,7 @@ async function dbsHome() {
     </div>`;
 
     $('#d-th').onclick = e => { e.preventDefault(); $('#theme').click(); dbsHome(); };
+    if ($('#d-pl')) $('#d-pl').onclick = e => { e.preventDefault(); S.db = null; S.table = null; S.tab = 'processes'; render(); };
     if ($('#d-lck')) $('#d-lck').onclick = e => { e.preventDefault(); S.db = null; S.table = null; S.tab = 'users'; render(); };
     if ($('#d-dirs')) $('#d-dirs').onclick = guard(manageSqliteDirs);
     if ($('#d-dirs2')) $('#d-dirs2').onclick = guard(manageSqliteDirs);
