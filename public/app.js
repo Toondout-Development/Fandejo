@@ -256,12 +256,20 @@ async function browse() {
       ${B.filters.length ? `<div class="chips" style="margin-top:4px">${B.filters.map((f, idx) => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;border-color:var(--accent)"><b>${esc(f.col)}</b> <span style="color:var(--accent)">${esc(f.op)}</span> ${opNeedsVal(f.op) ? `<code>${esc(f.val)}</code>` : ''}<a href="#" data-rmf="${idx}" style="color:var(--danger);text-decoration:none;font-weight:700" title="Remove filter">✕</a></span>`).join('')}</div>` : ''}
     </div>` : '';
 
-    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:230px"><button id="btf" class="${B.filters.length ? 'primary' : ''}" title="Filter by specific column (uses indexes)">⧩ Filter${B.filters.length ? ` (${B.filters.length})` : ''}</button><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search, filters, and sort as CSV">⬇ CSV</button><span class="spacer"></span>
+    C().innerHTML = `<div class="bar"><input id="bs" placeholder="Search all columns…" value="${esc(B.search)}" style="width:230px"><button id="btf" class="${B.filters.length ? 'primary' : ''}" title="Filter by specific column (uses indexes)">⧩ Filter${B.filters.length ? ` (${B.filters.length})` : ''}</button><span class="badge">${r.total} rows</span>${noKeyNotice}${r.is_view ? '<span class="badge">👁 Read-only view</span>' : ''}<button id="bcsv" title="Download the current search, filters, and sort as CSV">⬇ CSV</button>
+      <span id="bulk-bar" class="row" hidden style="margin-left:6px;padding-left:10px;border-left:1px solid var(--line)">
+        <span class="badge" id="bulk-cnt">0 selected</span>
+        ${canEdit ? `<button id="bulk-edit" class="primary" title="Edit selected rows (batch or individually)">✎ Edit</button>` : ''}
+        <button id="bulk-csv" title="Export selected rows as CSV">⬇ CSV</button>
+        <button id="bulk-sql" title="Export selected rows as SQL INSERT statements">⬇ SQL</button>
+        ${canEdit ? `<button id="bulk-del" class="danger" title="Delete selected rows">🗑 Delete</button>` : ''}
+      </span>
+      <span class="spacer"></span>
       <button id="pp" ${B.page <= 1 ? 'disabled' : ''}>‹</button><span>Page ${r.page} / ${pages}</span><button id="np" ${B.page >= pages ? 'disabled' : ''}>›</button>
       <select id="per">${[25, 50, 100, 250].map(n => `<option ${n === r.per ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
       ${filterBarHtml}
-      <div class="tw"><table><tr>${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
-      ${r.rows.map((row, i) => `<tr>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
+      <div class="tw"><table><tr>${r.rows.length ? `<th style="width:1%;cursor:default"><input type="checkbox" id="sel-all" title="Select all rows on this page"></th>` : ''}${canEdit ? '<th></th>' : ''}${r.columns.map(c => `<th data-c="${esc(c)}">${r.pk.includes(c) ? '<span class="pk" title="Primary key">🔑</span> ' : (uk.includes(c) ? '<span class="pk" title="Unique key">◈</span> ' : '')}${esc(c)}${B.sort === c ? (B.dir === 'asc' ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>
+      ${r.rows.map((row, i) => `<tr data-ri="${i}"><td><input type="checkbox" class="rchk" data-i="${i}"></td>${canEdit ? `<td class="act"><button class="ghost" data-e="${i}" title="Edit row">✎</button><button class="ghost danger" data-x="${i}" title="Delete row">🗑</button></td>` : ''}${r.columns.map(c => row[c] === null ? '<td class="null">NULL</td>' : `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('')}</tr>`).join('')}</table></div>
       ${r.rows.length ? '' : '<div class="empty">No rows</div>'}`;
     $('#bs').onkeydown = e => { if (e.key === 'Enter') { B.search = e.target.value; B.page = 1; render(); } };
     $('#btf').onclick = () => { B.showFilterBar = !B.showFilterBar; render(); };
@@ -295,6 +303,78 @@ async function browse() {
         const useAll = r.key_type === 'all' || (r.key_type === 'unique' && keyCols.some(k => row[k] === null));
         return Object.fromEntries((useAll ? r.columns : keyCols).map(k => [k, row[k]]));
     };
+
+    // Bulk row selection (with Shift-click range support) & bulk actions
+    const rowChecks = [...C().querySelectorAll('.rchk')];
+    let lastIdx = -1;
+    const syncBulk = () => {
+        const sel = rowChecks.filter(c => c.checked).map(c => +c.dataset.i);
+        const bar = $('#bulk-bar');
+        if (bar) {
+            bar.hidden = sel.length === 0;
+            $('#bulk-cnt').textContent = `${sel.length} selected`;
+        }
+        const sa = $('#sel-all');
+        if (sa) {
+            sa.checked = rowChecks.length > 0 && sel.length === rowChecks.length;
+            sa.indeterminate = sel.length > 0 && sel.length < rowChecks.length;
+        }
+        return sel;
+    };
+    if ($('#sel-all')) {
+        $('#sel-all').onchange = e => { rowChecks.forEach(c => { c.checked = e.target.checked; }); syncBulk(); };
+    }
+    rowChecks.forEach((chk, idx) => {
+        chk.onclick = e => {
+            if (e.shiftKey && lastIdx >= 0 && lastIdx !== idx) {
+                const [from, to] = [Math.min(lastIdx, idx), Math.max(lastIdx, idx)];
+                for (let k = from; k <= to; k++) rowChecks[k].checked = chk.checked;
+            }
+            lastIdx = idx;
+            syncBulk();
+        };
+    });
+    if ($('#bulk-csv')) {
+        $('#bulk-csv').onclick = () => {
+            const selRows = syncBulk().map(i => r.rows[i]);
+            if (!selRows.length) return;
+            const csv = '\uFEFF' + toCSV(r.columns, selRows.map(row => r.columns.map(c => row[c])));
+            download(new Blob([csv], { type: 'text/csv' }), `${S.table}_selected.csv`);
+            toast(`Exported ${selRows.length} row(s) to CSV`);
+        };
+    }
+    if ($('#bulk-sql')) {
+        $('#bulk-sql').onclick = () => {
+            const selRows = syncBulk().map(i => r.rows[i]);
+            if (!selRows.length) return;
+            const qId = id => S.driver === 'mysql' ? '`' + id.replace(/`/g, '``') + '`' : '"' + id.replace(/"/g, '""') + '"';
+            const qVal = v => v === null ? 'NULL' : "'" + String(v).replace(/'/g, "''") + "'";
+            const T = (S.driver === 'mysql' ? qId(S.db) + '.' : '') + qId(S.table);
+            const colList = r.columns.map(qId).join(', ');
+            const vals = selRows.map(row => '(' + r.columns.map(c => qVal(row[c])).join(', ') + ')').join(',\n');
+            const sql = `-- Fandejo Selected Rows Export (${selRows.length} rows)\nINSERT INTO ${T} (${colList}) VALUES\n${vals};\n`;
+            download(new Blob([sql], { type: 'application/sql' }), `${S.table}_selected.sql`);
+            toast(`Exported ${selRows.length} row(s) to SQL`);
+        };
+    }
+    if ($('#bulk-edit')) {
+        $('#bulk-edit').onclick = () => {
+            const sel = syncBulk();
+            if (!sel.length) return;
+            openBulkEditModal(sel.map(i => r.rows[i]), r, keyOf);
+        };
+    }
+    if ($('#bulk-del')) {
+        $('#bulk-del').onclick = () => {
+            const sel = syncBulk();
+            if (!sel.length) return;
+            confirmDo(`Delete ${sel.length} selected row(s) from ${S.table}?`, async () => {
+                const res = await api('bulk_delete', { db: S.db, table: S.table, keys: sel.map(i => keyOf(r.rows[i])) });
+                toast(`Deleted ${res.affected} row(s)`);
+                render();
+            });
+        };
+    }
     C().querySelectorAll('[data-x]').forEach(b => b.onclick = () => confirmDo(r.key_type === 'all' ? 'Delete this row? (Table has no primary/unique key — matching all column values)' : 'Delete this row?', async () => { await api('delete', { db: S.db, table: S.table, key: keyOf(r.rows[b.dataset.x]) }); render(); }));
     C().querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
         const row = r.rows[b.dataset.e];
@@ -326,37 +406,76 @@ function nowISO(base) {
     return `${dt} ${tm}`;
 }
 
-function renderFieldInput(name, pt, val, isInsert = false, extra = '', hasDef = false) {
+function renderFieldInput(name, pt, val, isInsert = false, extra = '', hasDef = false, prefix = '') {
+    const fn = prefix + name;
     const base = (pt?.base || '').toUpperCase();
     const isNull = val === null;
     const vStr = isNull ? '' : String(val ?? '');
     let inputHtml = '';
     if (base === 'DATE') {
-        inputHtml = `<input name="v_${esc(name)}" value="${esc(vStr.slice(0, 10))}" placeholder="YYYY-MM-DD" style="flex:1;font-family:ui-monospace,monospace">
-          <button type="button" data-cal="${esc(name)}" data-base="DATE" title="Open calendar picker">📅</button>
-          <button type="button" class="ghost" data-now="${esc(name)}" data-base="DATE" title="Fill today's date">Today</button>`;
+        inputHtml = `<input name="v_${esc(fn)}" value="${esc(vStr.slice(0, 10))}" placeholder="YYYY-MM-DD" style="flex:1;font-family:ui-monospace,monospace">
+          <button type="button" data-cal="${esc(fn)}" data-base="DATE" title="Open calendar picker">📅</button>
+          <button type="button" class="ghost" data-now="${esc(fn)}" data-base="DATE" title="Fill today's date">Today</button>`;
     } else if (base === 'DATETIME' || base === 'TIMESTAMP') {
         const dtVal = vStr ? vStr.replace('T', ' ').slice(0, 19) : '';
-        inputHtml = `<input name="v_${esc(name)}" value="${esc(dtVal)}" placeholder="YYYY-MM-DD HH:MM:SS" style="flex:1;font-family:ui-monospace,monospace">
-          <button type="button" data-cal="${esc(name)}" data-base="${base}" title="Open date & time picker">📅</button>
-          <button type="button" class="ghost" data-now="${esc(name)}" data-base="${base}" title="Fill current date & time">Now</button>`;
+        inputHtml = `<input name="v_${esc(fn)}" value="${esc(dtVal)}" placeholder="YYYY-MM-DD HH:MM:SS" style="flex:1;font-family:ui-monospace,monospace">
+          <button type="button" data-cal="${esc(fn)}" data-base="${base}" title="Open date & time picker">📅</button>
+          <button type="button" class="ghost" data-now="${esc(fn)}" data-base="${base}" title="Fill current date & time">Now</button>`;
     } else if (base === 'TIME') {
-        inputHtml = `<input type="time" step="1" name="v_${esc(name)}" value="${esc(vStr.slice(0, 8))}" style="flex:1">
-          <button type="button" class="ghost" data-now="${esc(name)}" data-base="TIME" title="Fill current time">Now</button>`;
+        inputHtml = `<input type="time" step="1" name="v_${esc(fn)}" value="${esc(vStr.slice(0, 8))}" style="flex:1">
+          <button type="button" class="ghost" data-now="${esc(fn)}" data-base="TIME" title="Fill current time">Now</button>`;
     } else if (base === 'YEAR') {
-        inputHtml = `<input type="number" min="1901" max="2155" placeholder="YYYY" name="v_${esc(name)}" value="${esc(vStr)}" style="flex:1">
-          <button type="button" class="ghost" data-now="${esc(name)}" data-base="YEAR">This year</button>`;
+        inputHtml = `<input type="number" min="1901" max="2155" placeholder="YYYY" name="v_${esc(fn)}" value="${esc(vStr)}" style="flex:1">
+          <button type="button" class="ghost" data-now="${esc(fn)}" data-base="YEAR">This year</button>`;
     } else if (base === 'ENUM' && pt.values?.length) {
-        inputHtml = `<select name="v_${esc(name)}" style="flex:1">${pt.values.map(v => `<option ${v === vStr ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`;
+        inputHtml = `<select name="v_${esc(fn)}" style="flex:1">${pt.values.map(v => `<option ${v === vStr ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`;
     } else if (['TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'JSON'].includes(base)) {
-        inputHtml = `<textarea name="v_${esc(name)}" rows="2" style="flex:1">${esc(vStr)}</textarea>`;
+        inputHtml = `<textarea name="v_${esc(fn)}" rows="2" style="flex:1">${esc(vStr)}</textarea>`;
     } else {
-        inputHtml = `<input name="v_${esc(name)}" value="${esc(vStr)}" style="flex:1">`;
+        inputHtml = `<input name="v_${esc(fn)}" value="${esc(vStr)}" style="flex:1">`;
     }
     const toggleBox = isInsert
-        ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(name)}" ${/auto_?increment|rowid auto/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
-        : `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="n_${esc(name)}" ${isNull ? 'checked' : ''}>NULL</label>`;
+        ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(fn)}" ${/auto_?increment|rowid auto/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
+        : `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="n_${esc(fn)}" ${isNull ? 'checked' : ''}>NULL</label>`;
     return `<label>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}</small><div class="row" style="position:relative">${inputHtml}${toggleBox}</div></label>`;
+}
+
+function openBulkEditModal(selRows, r, keyOf) {
+    const meta = r.col_meta || {};
+    const rowLabel = (row, idx) => {
+        const k = keyOf(row);
+        const parts = Object.entries(k).filter(([c]) => c !== '__rowid__').slice(0, 3).map(([c, v]) => `${c}=${v ?? 'NULL'}`);
+        return parts.length ? `Row #${idx + 1} (${parts.join(', ')})` : `Row #${idx + 1}`;
+    };
+
+    modal(`<div style="width:min(680px,85vw)">
+      <h3>Edit ${selRows.length} selected row(s)</h3>
+      <div style="display:flex;flex-direction:column;gap:12px">
+        ${selRows.map((row, idx) => `<fieldset class="pg" style="margin:0"><legend><b>${esc(rowLabel(row, idx))}</b></legend>
+          <div class="form">${r.columns.map(c => renderFieldInput(c, meta[c] || { base: 'VARCHAR' }, row[c], false, '', false, `r${idx}_`)).join('')}</div>
+        </fieldset>`).join('')}
+      </div>
+    </div>`, async f => {
+        const updates = [];
+        selRows.forEach((row, idx) => {
+            const values = {};
+            r.columns.forEach(c => {
+                const pfx = `r${idx}_${c}`;
+                const base = (meta[c]?.base || '').toUpperCase();
+                let nv = f['n_' + pfx] ? null : f['v_' + pfx];
+                if (nv !== null && ['DATETIME', 'TIMESTAMP'].includes(base)) nv = nv.replace('T', ' ');
+                if (nv !== row[c] && String(nv) !== String(row[c])) values[c] = nv;
+                else if (nv === null && row[c] !== null) values[c] = null;
+            });
+            if (Object.keys(values).length) updates.push({ key: keyOf(row), values });
+        });
+        if (!updates.length) return;
+        const res = await api('bulk_update', { db: S.db, table: S.table, updates });
+        toast(`Updated ${res.affected} row(s)`);
+        render();
+    });
+
+    wireFieldInputs($('#modal form'));
 }
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];

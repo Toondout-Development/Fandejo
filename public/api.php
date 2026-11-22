@@ -1354,6 +1354,69 @@ try {
         $s->execute(array_merge(array_values($v), $args));
         out(['ok' => true, 'affected' => $s->rowCount()]);
 
+    case 'bulk_delete':
+        $keys = $in['keys'] ?? [];
+        if (!$keys || !is_array($keys)) fail('Select at least one row to delete');
+        $limit = $drv === 'mysql' ? ' LIMIT 1' : '';
+        $deleted = 0;
+        $p->beginTransaction();
+        try {
+            foreach ($keys as $key) {
+                if (!is_array($key) || !$key) continue;
+                $w = []; $args = [];
+                foreach ($key as $k => $val) {
+                    $colSql = ($drv === 'sqlite' && $k === '__rowid__') ? 'rowid' : q((string)$k, $drv);
+                    if ($val === null) $w[] = "$colSql IS NULL";
+                    else { $w[] = "$colSql = ?"; $args[] = $val; }
+                }
+                $s = $p->prepare("DELETE FROM $T WHERE " . implode(' AND ', $w) . $limit);
+                $s->execute($args);
+                $deleted += $s->rowCount();
+            }
+            $p->commit();
+        } catch (Throwable $e) {
+            if ($p->inTransaction()) $p->rollBack();
+            throw $e;
+        }
+        out(['ok' => true, 'affected' => $deleted]);
+
+    case 'bulk_update':
+        $limit = $drv === 'mysql' ? ' LIMIT 1' : '';
+        $updated = 0;
+        $items = [];
+        if (!empty($in['updates']) && is_array($in['updates'])) {
+            // Individual per-row updates: [{key: {...}, values: {...}}, ...]
+            $items = $in['updates'];
+        } elseif (!empty($in['keys']) && is_array($in['keys']) && !empty($in['values']) && is_array($in['values'])) {
+            // Batch update: same values applied to multiple row keys
+            foreach ($in['keys'] as $k) $items[] = ['key' => $k, 'values' => $in['values']];
+        } else {
+            fail('No row updates provided');
+        }
+        $p->beginTransaction();
+        try {
+            foreach ($items as $item) {
+                $key = $item['key'] ?? [];
+                $vals = $item['values'] ?? [];
+                if (!is_array($key) || !$key || !is_array($vals) || !$vals) continue;
+                $w = []; $args = [];
+                foreach ($key as $k => $val) {
+                    $colSql = ($drv === 'sqlite' && $k === '__rowid__') ? 'rowid' : q((string)$k, $drv);
+                    if ($val === null) $w[] = "$colSql IS NULL";
+                    else { $w[] = "$colSql = ?"; $args[] = $val; }
+                }
+                $set = implode(',', array_map(fn($k) => q((string)$k, $drv) . ' = ?', array_keys($vals)));
+                $s = $p->prepare("UPDATE $T SET $set WHERE " . implode(' AND ', $w) . $limit);
+                $s->execute(array_merge(array_values($vals), $args));
+                $updated += $s->rowCount();
+            }
+            $p->commit();
+        } catch (Throwable $e) {
+            if ($p->inTransaction()) $p->rollBack();
+            throw $e;
+        }
+        out(['ok' => true, 'affected' => $updated]);
+
     case 'query':
         $results = [];
         // split on ; outside quotes and SQL comments

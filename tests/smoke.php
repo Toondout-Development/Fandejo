@@ -106,6 +106,13 @@ $bf = call('browse', ['db' => $dbName, 'table' => 'u', 'filters' => [['col' => '
 if (($bf['total'] ?? 0) !== 2) { echo "  [FAIL] Column filter expected 2 rows, got " . ($bf['total'] ?? 'null') . "\n"; $failures++; }
 $bfNull = call('browse', ['db' => $dbName, 'table' => 'u', 'filters' => [['col' => 'years', 'op' => 'IS NULL']]]);
 if (($bfNull['total'] ?? 0) !== 1) { echo "  [FAIL] IS NULL filter expected 1 row, got " . ($bfNull['total'] ?? 'null') . "\n"; $failures++; }
+// Test bulk_update in both batch mode (keys + values) and individual mode (updates)
+$bupd1 = call('bulk_update', ['db' => $dbName, 'table' => 'u', 'keys' => [['id' => 3], ['id' => 4]], 'values' => ['years' => 40]]);
+if (($bupd1['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_update (batch) expected 2 rows updated, got " . ($bupd1['affected'] ?? 'null') . "\n"; $failures++; }
+$bupd2 = call('bulk_update', ['db' => $dbName, 'table' => 'u', 'updates' => [['key' => ['id' => 3], 'values' => ['name' => 'chuck']], ['key' => ['id' => 4], 'values' => ['name' => 'david']]]]);
+if (($bupd2['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_update (individual) expected 2 rows updated, got " . ($bupd2['affected'] ?? 'null') . "\n"; $failures++; }
+$bdel = call('bulk_delete', ['db' => $dbName, 'table' => 'u', 'keys' => [['id' => 3], ['id' => 4]]]);
+if (($bdel['affected'] ?? 0) !== 2) { echo "  [FAIL] bulk_delete expected 2 rows deleted, got " . ($bdel['affected'] ?? 'null') . "\n"; $failures++; }
 call('export_csv', ['db' => $dbName, 'table' => 'u', 'delimiter' => ',', 'header' => true, 'null_as' => 'NULL']);
 call('server_info');
 
