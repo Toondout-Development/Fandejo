@@ -95,7 +95,7 @@ function fandejo_version(): string {
         $v = trim((string)@file_get_contents($vf));
         if ($v !== '') return $v;
     }
-    return 'v1.0.0';
+    return 'v1.0.1';
 }
 
 /** Load config.php (from project root or public/, or FANDEJO_CONFIG env var) combined with sensible defaults. */
@@ -342,14 +342,33 @@ function clear_login_failures(string $drv, string $user): void {
 function is_full_admin(?PDO $p, string $drv, array $c): bool {
     if ($drv === 'sqlite') return true;
     if (!$p) return false;
+    // 1. Check active connection grants via SHOW GRANTS (universal across MySQL & MariaDB)
     try {
-        foreach (parse_grants($p, $c['user'], '%') as $s) {
+        $lines = array_column($p->query('SHOW GRANTS')->fetchAll(PDO::FETCH_NUM), 0);
+        foreach (parse_grant_lines($lines) as $s) {
             if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
         }
     } catch (Throwable) {}
+    // 2. Fallback to standard SHOW GRANTS FOR CURRENT_USER()
     try {
-        $lines = array_column($p->query('SHOW GRANTS CURRENT_USER()')->fetchAll(PDO::FETCH_NUM), 0);
+        $lines = array_column($p->query('SHOW GRANTS FOR CURRENT_USER()')->fetchAll(PDO::FETCH_NUM), 0);
         foreach (parse_grant_lines($lines) as $s) {
+            if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
+        }
+    } catch (Throwable) {}
+    // 3. Fallback checking active session CURRENT_USER() host resolution
+    try {
+        $cu = (string)$p->query('SELECT CURRENT_USER()')->fetchColumn();
+        if (str_contains($cu, '@')) {
+            [$u, $h] = explode('@', $cu, 2);
+            foreach (parse_grants($p, $u, $h) as $s) {
+                if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
+            }
+        }
+    } catch (Throwable) {}
+    // 4. Fallback checking specific user@% if configured
+    try {
+        foreach (parse_grants($p, $c['user'], '%') as $s) {
             if ($s['db'] === '*' && ($s['all'] || in_array('CREATE USER', $s['privs'], true) || in_array('SUPER', $s['privs'], true))) return true;
         }
     } catch (Throwable) {}
@@ -525,6 +544,7 @@ function run_sql(PDO $p, string $sql, int $maxRows = 1000): array {
 const PRIV_GLOBAL = ['SELECT','INSERT','UPDATE','DELETE','CREATE','DROP','REFERENCES','INDEX','ALTER','CREATE TEMPORARY TABLES','LOCK TABLES','CREATE VIEW','SHOW VIEW','CREATE ROUTINE','ALTER ROUTINE','EXECUTE','EVENT','TRIGGER','FILE','PROCESS','RELOAD','SHUTDOWN','SHOW DATABASES','SUPER','CREATE USER','REPLICATION SLAVE','REPLICATION CLIENT'];
 const PRIV_DB = ['SELECT','INSERT','UPDATE','DELETE','CREATE','DROP','REFERENCES','INDEX','ALTER','CREATE TEMPORARY TABLES','LOCK TABLES','CREATE VIEW','SHOW VIEW','CREATE ROUTINE','ALTER ROUTINE','EXECUTE','EVENT','TRIGGER'];
 const PRIV_TABLE = ['SELECT','INSERT','UPDATE','DELETE','CREATE','DROP','REFERENCES','INDEX','ALTER','CREATE VIEW','SHOW VIEW','TRIGGER'];
+const DB_SYSTEM_USERS = ['mariadb.sys', 'mysql.sys', 'mysql.session', 'mysql.infoschema'];
 
 function priv_catalog(string $db, string $tb): array {
     return $db === '*' ? PRIV_GLOBAL : ($tb === '*' ? PRIV_DB : PRIV_TABLE);
@@ -2257,20 +2277,21 @@ try {
             out(['users' => $uList, 'me' => $c['user'], 'is_admin' => true, 'lockouts' => $locks, 'max_login_attempts' => $cfg['max_login_attempts'], 'admin_lockout_seconds' => $cfg['admin_lockout_seconds']]);
         }
         $dbLocks = [];
+        $sysUsersSql = implode(',', array_map(fn($u) => $p->quote($u), DB_SYSTEM_USERS));
         try {
-            foreach (rows($p, 'SELECT User user, Host host, account_locked locked FROM mysql.user') as $lr) {
+            foreach (rows($p, "SELECT User user, Host host, account_locked locked FROM mysql.user WHERE User NOT IN ($sysUsersSql)") as $lr) {
                 $dbLocks[$lr['user'] . '@' . $lr['host']] = strtoupper((string)($lr['locked'] ?? 'N')) === 'Y';
             }
         } catch (Throwable) {
             // MariaDB fallback: check account_locked in mysql.global_priv JSON Priv column
             try {
-                foreach (rows($p, 'SELECT User user, Host host, Priv priv FROM mysql.global_priv') as $lr) {
+                foreach (rows($p, "SELECT User user, Host host, Priv priv FROM mysql.global_priv WHERE User NOT IN ($sysUsersSql)") as $lr) {
                     $pj = json_decode((string)($lr['priv'] ?? '{}'), true);
                     $dbLocks[$lr['user'] . '@' . $lr['host']] = !empty($pj['account_locked']);
                 }
             } catch (Throwable) {}
         }
-        $r = rows($p, 'SELECT User user, Host host FROM mysql.user ORDER BY 1,2');
+        $r = rows($p, "SELECT User user, Host host FROM mysql.user WHERE User NOT IN ($sysUsersSql) ORDER BY 1,2");
         foreach ($r as &$u) {
             try { $u['scopes'] = parse_grants($p, $u['user'], $u['host']); } catch (Throwable $e) { $u['scopes'] = []; }
             $lk = $locks['accounts']['mysql:' . $u['user']] ?? null;
@@ -2368,6 +2389,9 @@ try {
             if ($targetUser === $c['user']) $_SESSION['c']['sealed_pass'] = seal_secret((string)$in['pass']);
             out(['ok' => true]);
         }
+        if ($drv === 'mysql' && in_array(strtolower(trim((string)($in['user'] ?? ''))), DB_SYSTEM_USERS, true)) {
+            fail('Cannot modify internal database system account', 403);
+        }
         $p->exec('ALTER USER ' . acct_sql($p, $in['user'], $in['host']) . ' IDENTIFIED BY ' . $p->quote($in['pass'])); out(['ok' => true]);
 
     case 'create_user':
@@ -2393,6 +2417,9 @@ try {
             unset($users[$targetUser]);
             save_sqlite_config($cfg['sqlite_dirs'], $users);
             out(['ok' => true]);
+        }
+        if ($drv === 'mysql' && in_array(strtolower(trim((string)($in['user'] ?? ''))), DB_SYSTEM_USERS, true)) {
+            fail('Cannot drop internal database system account', 403);
         }
         $p->exec('DROP USER ' . $p->quote($in['user']) . '@' . $p->quote($in['host'])); out(['ok' => true]);
 

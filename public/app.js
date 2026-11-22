@@ -37,7 +37,7 @@ function engineSelectOpts(sel) {
     return list.map(e => `<option value="${esc(e)}" ${e === sel ? 'selected' : ''}>${esc(e)}</option>`).join('');
 }
 
-const S = { version: 'v1.0.0', driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, fkBack: [], sql: '' };
+const S = { version: 'v1.0.1', driver: null, user: null, dbs: [], tables: {}, meta: null, db: null, table: null, tab: 'browse', filter: '', browse: { page: 1, per: getPrefs().perPage, sort: '', dir: 'asc', search: '', filters: [], showFilterBar: false }, fkBack: [], sql: '' };
 
 function showLicenseModal() {
     modal(`<div style="width:min(580px,85vw)"><h3>Fandejo ${esc(S.version)} — License & Attribution</h3>
@@ -2059,13 +2059,17 @@ async function accountDetail(u, me, isAdmin = true, maxAttempts = 5) {
     const isLocked = u.fandejo_locked || u.db_locked;
     const lockedIpsList = (u.by_ip || []).filter(s => s.locked).map(s => s.ip);
 
+    const unlockBtnLabel = (u.fandejo_locked && u.db_locked) ? '🔓 Unlock Account & IPs'
+        : (u.fandejo_locked ? '🔓 Unlock All IPs'
+        : (u.db_locked ? '🔓 Unlock Server Account' : 'Reset Counter'));
+
     const lockAlert = (u.fandejo_locked || u.db_locked || u.failed_attempts > 0) ? `<div class="msg ${isLocked ? 'err' : ''}" style="display:flex;align-items:center;gap:10px;margin-top:14px">
       <div style="flex:1">
         ${u.fandejo_locked ? `<b>🔒 Per-IP Hard Lockout Active:</b> Locked for IP${lockedIpsList.length > 1 ? 's' : ''} <code>${esc(lockedIpsList.join(', ') || u.last_ip || 'unknown')}</code> (${u.failed_attempts} total failed attempts). ` : ''}
         ${u.db_locked ? `<b>🔒 Database Engine Lock:</b> This MySQL/MariaDB user has <code>ACCOUNT LOCK</code> enabled on the server. ` : ''}
         ${!isLocked && u.failed_attempts ? `<b>⚠ Failed Sign-in Attempts:</b> ${u.failed_attempts} failed attempt(s) tracked (last IP: <code>${esc(u.last_ip || '–')}</code>; locks at ${maxAttempts} per IP).` : ''}
       </div>
-      ${isAdmin ? `<button id="u-unlock" class="primary">${isLocked ? '🔓 Unlock All IPs' : 'Reset Counter'}</button>` : ''}
+      ${isAdmin ? `<button id="u-unlock" class="primary">${unlockBtnLabel}</button>` : ''}
     </div>` : '';
 
     $('#ad').innerHTML = `<div class="acct-head"><div class="avatar big">${esc((u.user || '?')[0].toUpperCase())}</div><div style="flex:1"><h2 style="margin:0">${esc(u.user || '(anonymous)')}<span style="color:var(--mute)">@${esc(u.host)}</span></h2><small>${isMe ? 'This is the account you are signed in with' : (my ? `${g.scopes.length} privilege scope${g.scopes.length === 1 ? '' : 's'}` : 'SQLite Sandbox Administrator (config.php)')}</small></div>
