@@ -1,7 +1,7 @@
 <?php
 // Unit test for the SHOW GRANTS parser. Run: php tests/grants_parse.php
 $src = file_get_contents(__DIR__ . '/../public/api.php');
-preg_match('/(const PRIV_GLOBAL.*?)\n\$in = json_decode/s', $src, $m);
+preg_match('/(const PRIV_GLOBAL.*?)\n\$rawBody = /s', $src, $m);
 eval($m[1]);
 $r = parse_grant_lines([
   "GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` IDENTIFIED VIA mysql_native_password USING 'x' WITH GRANT OPTION",

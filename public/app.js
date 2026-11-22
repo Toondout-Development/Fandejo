@@ -193,7 +193,7 @@ function render() {
     if ($('#cdb')) $('#cdb').onclick = guard(async e => { e.preventDefault(); S.fkBack = []; S.table = null; S.tab = 'tables'; await loadTables(S.db); render(); });
     const tabs = S.table ? [['browse', 'Browse'], ['structure', 'Structure'], ['sql', 'SQL'], ['insert', 'Insert'], ['export', 'Export'], ['import', 'Import'], ['ops', 'Operations']]
         : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
-            : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL']];
+            : [['home', 'Dashboard'], ['users', 'Users'], ['sql', 'SQL'], ['export', 'Export DB'], ['import', 'Import DB']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
     $('#tabs').querySelectorAll('.tab').forEach(t => t.onclick = () => { S.tab = t.dataset.k; render(); });
@@ -610,7 +610,7 @@ function renderFieldInput(name, pt, val, isInsert = false, extra = '', hasDef = 
         ? `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="s_${esc(fn)}" ${/auto_?increment|rowid auto/i.test(extra) || hasDef ? 'checked' : ''}>skip / default</label>`
         : `<label style="flex-direction:row;gap:4px"><input type="checkbox" name="n_${esc(fn)}" ${isNull ? 'checked' : ''}>NULL</label>`;
     const fkBadge = pt?.fk ? ` <span style="color:var(--cyan)" title="Foreign key">→ ${esc(pt.fk.ref_table)}.${esc(pt.fk.ref_col)}</span>` : '';
-    return `<label>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}${fkBadge}</small><div class="row" style="position:relative">${inputHtml}${fkBtn}${toggleBox}</div></label>`;
+    return `<label><span>${esc(name)} <small style="color:var(--mute)">${esc(pt?.raw_type || base)} ${esc(extra)}${fkBadge}</small></span><div class="row" style="position:relative">${inputHtml}${fkBtn}${toggleBox}</div></label>`;
 }
 
 function openBulkEditModal(selRows, r, keyOf) {
@@ -1313,46 +1313,146 @@ function guessType(vals) {
 }
 
 async function exportView() {
-    const t = S.tables[S.db] || [];
-    C().innerHTML = `<form class="form" id="ef" style="max-width:560px"><label>Format<select name="fmt"><option value="sql">SQL (structure and/or data)</option><option value="csv">CSV (one table)</option></select></label>
-    <div id="sqlopts"><label>Tables</label>${t.map(x => `<label style="flex-direction:row;gap:6px"><input type="checkbox" name="t" value="${esc(x.name)}" ${!S.table || S.table === x.name ? 'checked' : ''}>${esc(x.name)}</label>`).join('')}
-      <label style="flex-direction:row;gap:6px"><input type="checkbox" name="structure" checked>Structure</label><label style="flex-direction:row;gap:6px"><input type="checkbox" name="data" checked>Data</label></div>
+    let targetDb = S.db || S.dbs[0]?.name || '';
+    if (targetDb && !S.tables[targetDb]) await loadTables(targetDb);
+    const t = S.tables[targetDb] || [];
+    const my = S.driver === 'mysql';
+    C().innerHTML = `<form class="form" id="ef" style="max-width:600px">
+    <h3>⬇ Export ${S.table ? `Table <code>${esc(S.table)}</code>` : `Database <code>${esc(targetDb)}</code>`}</h3>
+    ${!S.db && S.dbs.length ? `<label>Database to export<select name="exp_db" id="exp-db">${S.dbs.map(d => `<option value="${esc(d.name)}" ${d.name === targetDb ? 'selected' : ''}>${esc(d.label || d.name)} (${d.tables ?? 0} tables)</option>`).join('')}</select></label>` : ''}
+    <div class="ce-grid">
+      <label>Format<select name="fmt"><option value="sql">SQL (database / tables)</option><option value="csv">CSV (single table)</option></select></label>
+      <label>Compression<select name="compress"><option value="none">None (plain .sql / .csv)</option><option value="gzip">Gzip (.gz)</option><option value="zip">ZIP archive (.zip)</option></select></label>
+    </div>
+    <div id="sqlopts">
+      <div class="bar" style="margin:4px 0">
+        <span style="font-size:12px;color:var(--mute)">Tables to include (${t.length})</span>
+        <span class="spacer"></span>
+        <button type="button" class="ghost" id="exp-all" style="font-size:12px;padding:2px 8px">Select All (Full DB)</button>
+        <button type="button" class="ghost" id="exp-none" style="font-size:12px;padding:2px 8px">Select None</button>
+      </div>
+      <div style="max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--bg);display:flex;flex-direction:column;gap:5px">
+        ${t.length ? t.map(x => `<label style="flex-direction:row;gap:8px;color:var(--text)"><input type="checkbox" name="t" value="${esc(x.name)}" ${!S.table || S.table === x.name ? 'checked' : ''}><span>${esc(x.name)}</span><small style="color:var(--mute);margin-left:auto">${x.type?.includes('VIEW') || x.type === 'view' ? 'VIEW' : (x.rows ?? 0) + ' rows'}</small></label>`).join('') : '<div class="empty" style="padding:12px">No tables in this database</div>'}
+      </div>
+      <div class="bar" style="margin-top:8px;margin-bottom:0">
+        <label class="pc" style="flex:1"><input type="checkbox" name="structure" checked><span>Structure</span><small>CREATE TABLE / VIEW statements</small></label>
+        <label class="pc" style="flex:1"><input type="checkbox" name="data" checked><span>Data</span><small>Batched multi-row INSERTs</small></label>
+      </div>
+      ${my ? `<label class="pc" style="margin-top:6px"><input type="checkbox" name="create_db" ${!S.table ? 'checked' : ''}><span>Include <code>CREATE DATABASE IF NOT EXISTS</code> & <code>USE</code></span><small>Recommended when exporting an entire database for backup or migration</small></label>` : ''}
+    </div>
     <div id="csvopts" hidden><label>Table<select name="ct">${t.map(x => `<option ${S.table === x.name ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
       <div class="ce-grid"><label>Delimiter<select name="delim">${Object.entries(DELIMS).map(([k, v]) => `<option value="${k === '\t' ? 'tab' : k}">${v}</option>`).join('')}</select></label><label>NULL written as<input name="null_as" placeholder="(empty)"></label></div>
       <label class="pc"><input type="checkbox" name="header" checked><span>Header row</span><small>First line contains column names</small></label>
       <label class="pc"><input type="checkbox" name="bom"><span>UTF-8 BOM</span><small>Helps Excel read accents correctly</small></label></div>
-    <button class="primary">Download</button></form>`;
-    const f = $('#ef'); f.fmt.onchange = () => { $('#sqlopts').hidden = f.fmt.value !== 'sql'; $('#csvopts').hidden = f.fmt.value !== 'csv'; };
+    <button class="primary">⬇ Download Export</button></form>`;
+    const f = $('#ef');
+    if ($('#exp-db')) {
+        $('#exp-db').onchange = guard(async e => {
+            S.db = e.target.value; S.table = null;
+            await loadTables(S.db); render();
+        });
+    }
+    const tBoxes = () => [...f.querySelectorAll('input[name="t"]')];
+    if ($('#exp-all')) $('#exp-all').onclick = () => tBoxes().forEach(c => { c.checked = true; });
+    if ($('#exp-none')) $('#exp-none').onclick = () => tBoxes().forEach(c => { c.checked = false; });
+    f.fmt.onchange = () => { $('#sqlopts').hidden = f.fmt.value !== 'sql'; $('#csvopts').hidden = f.fmt.value !== 'csv'; };
     f.onsubmit = guard(async e => {
-        e.preventDefault(); const d = new FormData(f);
-        if (f.fmt.value === 'csv') return exportCSV({ table: f.ct.value, delimiter: f.delim.value === 'tab' ? '\t' : f.delim.value, null_as: f.null_as.value, header: f.header.checked, bom: f.bom.checked });
-        return exportSQL({ tables: d.getAll('t'), structure: !!d.get('structure'), data: !!d.get('data') });
+        e.preventDefault(); const d = new FormData(f), comp = f.compress.value;
+        const dbUse = $('#exp-db')?.value || targetDb;
+        if (f.fmt.value === 'csv') return exportCSV({ db: dbUse, table: f.ct.value, delimiter: f.delim.value === 'tab' ? '\t' : f.delim.value, null_as: f.null_as.value, header: f.header.checked, bom: f.bom.checked, compress: comp });
+        const picked = d.getAll('t');
+        if (!picked.length) throw new Error('Select at least one table to export');
+        return exportSQL({ db: dbUse, table: picked.length === 1 ? picked[0] : null, tables: picked, structure: !!d.get('structure'), data: !!d.get('data'), create_db: !!d.get('create_db'), compress: comp });
     });
 }
+function compExt(comp) { return comp === 'gzip' ? '.gz' : comp === 'zip' ? '.zip' : ''; }
 async function exportSQL(o) {
-    const res = await fetch('api.php?a=export_sql', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: S.db, table: S.table, ...o }) });
-    if (!(res.headers.get('Content-Type') || '').includes('application/sql')) { const j = await res.json().catch(() => ({})); throw new Error(j.error || 'SQL export failed'); }
-    download(await res.blob(), (S.table || S.db || 'export') + '.sql'); toast('SQL export downloaded');
+    const dbUse = o.db || S.db;
+    const res = await fetch('api.php?a=export_sql', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: dbUse, table: S.table, ...o }) });
+    const ct = res.headers.get('Content-Type') || '';
+    if (!ct.includes('application/sql') && !ct.includes('application/gzip') && !ct.includes('application/zip')) { const j = await res.json().catch(() => ({})); throw new Error(j.error || 'SQL export failed'); }
+    const fname = (o.table || dbUse || 'export').replace(/^@\d+:/, '');
+    download(await res.blob(), fname + '.sql' + compExt(o.compress)); toast('SQL export downloaded');
 }
 async function exportCSV(o) {
-    const res = await fetch('api.php?a=export_csv', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: S.db, ...o }) });
-    if (!(res.headers.get('Content-Type') || '').includes('text/csv')) { const j = await res.json().catch(() => ({})); throw new Error(j.error || 'Export failed'); }
-    download(await res.blob(), o.table + '.csv'); toast('CSV downloaded');
+    const dbUse = o.db || S.db;
+    const res = await fetch('api.php?a=export_csv', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf }, body: JSON.stringify({ db: dbUse, ...o }) });
+    const ct = res.headers.get('Content-Type') || '';
+    if (!ct.includes('text/csv') && !ct.includes('application/gzip') && !ct.includes('application/zip')) { const j = await res.json().catch(() => ({})); throw new Error(j.error || 'Export failed'); }
+    download(await res.blob(), o.table + '.csv' + compExt(o.compress)); toast('CSV downloaded');
 }
 
 async function importView() {
-    const tbls = S.tables[S.db] || [];
-    C().innerHTML = `<div class="form" style="max-width:980px"><label>Format<select id="ifmt"><option value="csv">CSV file</option><option value="sql">SQL script</option></select></label>
-      <div id="sqlimp" hidden><label>SQL file<input type="file" id="fi" accept=".sql,.txt"></label><button class="primary" id="go">Run script</button><div id="res"></div></div>
-      <div id="csvimp"><label>CSV file<input type="file" id="cf" accept=".csv,.tsv,.txt,text/csv"></label><div id="cfg"></div></div></div>`;
+    let targetDb = S.db || S.dbs[0]?.name || '';
+    if (targetDb && !S.tables[targetDb]) await loadTables(targetDb);
+    const tbls = S.tables[targetDb] || [];
+    const defFmt = S.table ? 'csv' : 'sql';
+    C().innerHTML = `<div class="form" style="max-width:980px">
+      <h3>⬆ Import into ${S.table ? `Table <code>${esc(S.table)}</code>` : `Database <code>${esc(targetDb || '(new / script-defined)')}</code>`}</h3>
+      <div class="ce-grid">
+        <label>Target Database<select id="imp-db">
+          ${S.driver === 'mysql' ? `<option value="" ${!targetDb ? 'selected' : ''}>— None (SQL script contains CREATE DATABASE / USE) —</option>` : ''}
+          ${S.dbs.map(d => `<option value="${esc(d.name)}" ${d.name === targetDb ? 'selected' : ''}>${esc(d.label || d.name)}</option>`).join('')}
+          <option value="__new__">+ Create new database first…</option>
+        </select></label>
+        <label>Format<select id="ifmt"><option value="sql" ${defFmt === 'sql' ? 'selected' : ''}>SQL database dump / script (.sql, .sql.gz, .sql.zip)</option><option value="csv" ${defFmt === 'csv' ? 'selected' : ''}>CSV table data (.csv, .tsv, .csv.gz, .csv.zip)</option></select></label>
+      </div>
+      <div id="sqlimp" ${defFmt === 'sql' ? '' : 'hidden'}>
+        <label><span>SQL file (plain <code>.sql</code>, Gzip <code>.sql.gz</code>, or ZIP <code>.sql.zip</code>)</span><input type="file" id="fi" accept=".sql,.txt,.gz,.zip,application/gzip,application/zip"></label>
+        <div class="bar" style="margin-top:8px"><button class="primary" id="go">▶ Upload & Run SQL Dump</button></div>
+        <div id="res"></div>
+      </div>
+      <div id="csvimp" ${defFmt === 'csv' ? '' : 'hidden'}><label><span>CSV file (plain <code>.csv</code>, Gzip <code>.csv.gz</code>, or ZIP <code>.csv.zip</code>)</span><input type="file" id="cf" accept=".csv,.tsv,.txt,.gz,.zip,text/csv,application/gzip,application/zip"></label><div id="cfg"></div></div></div>`;
+    $('#imp-db').onchange = guard(async e => {
+        if (e.target.value === '__new__') {
+            e.target.value = targetDb;
+            return promptNewDb();
+        }
+        S.db = targetDb = e.target.value;
+        S.table = null;
+        await loadTables(S.db);
+        render();
+    });
     $('#ifmt').onchange = e => { $('#sqlimp').hidden = e.target.value !== 'sql'; $('#csvimp').hidden = e.target.value !== 'csv'; };
     $('#go').onclick = guard(async () => {
         const f = $('#fi').files[0]; if (!f) throw new Error('Choose a file first');
-        const r = await api('query', { db: S.db, sql: await f.text() }); const err = r.results.find(x => x.error);
-        $('#res').innerHTML = err ? `<div class="msg err">${esc(err.error)}</div>` : `<div class="msg ok">${r.results.length} statements executed</div>`;
-        await loadTables(S.db); tree();
+        $('#go').disabled = true;
+        $('#res').innerHTML = `<div class="msg">Uploading & executing ${esc(f.name)} (${fmtSize(f.size)}) into <b>${esc(targetDb || 'server')}</b>…</div>`;
+        try {
+            const fd = new FormData();
+            fd.append('db', targetDb || '');
+            fd.append('file', f);
+            const res = await fetch('api.php?a=import_sql_file', { method: 'POST', headers: { 'X-CSRF': csrf }, body: fd });
+            const r = await res.json().catch(() => ({ error: 'Invalid server response' }));
+            if (r.error && r.ok === undefined) throw new Error(r.error);
+            $('#res').innerHTML = !r.ok
+                ? `<div class="msg err"><b>Error after ${r.executed} of ${r.total} statements:</b> ${esc(r.error)}${r.failed_sql ? `<br><small>${esc(r.failed_sql)}</small>` : ''}</div>`
+                : `<div class="msg ok">Executed all ${r.executed} SQL statements from <b>${esc(f.name)}</b></div>`;
+            await loadDbs();
+            if (targetDb) await loadTables(targetDb);
+            tree();
+            if (r.ok) toast('SQL import complete');
+        } finally {
+            $('#go').disabled = false;
+        }
     });
-    $('#cf').onchange = guard(async e => { const f = e.target.files[0]; if (f) csvWizard(await f.text(), f.name, tbls); });
+    $('#cf').onchange = guard(async e => {
+        const f = e.target.files[0];
+        if (!f) return;
+        if (targetDb && S.db !== targetDb) S.db = targetDb;
+        if (/\.(gz|zip)$/i.test(f.name)) {
+            $('#cfg').innerHTML = `<div class="msg">Decompressing ${esc(f.name)}…</div>`;
+            const fd = new FormData();
+            fd.append('db', targetDb || '');
+            fd.append('file', f);
+            const res = await fetch('api.php?a=decompress_file', { method: 'POST', headers: { 'X-CSRF': csrf }, body: fd });
+            const r = await res.json().catch(() => ({ error: 'Decompression failed' }));
+            if (!res.ok || r.error) throw new Error(r.error || 'Decompression failed');
+            csvWizard(r.text, r.name || f.name, tbls);
+        } else {
+            csvWizard(await f.text(), f.name, tbls);
+        }
+    });
 }
 
 function csvWizard(text, fname, tbls) {

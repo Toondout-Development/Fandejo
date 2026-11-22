@@ -834,7 +834,94 @@ function filter_sql(string $drv, array $cols, array $in, array &$args): array {
     return [$where, $order];
 }
 
-$in = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
+/** Build a single-file PKZIP archive in pure PHP (using zlib raw deflate, no ext-zip required). */
+function build_single_file_zip(string $entryName, string $content): string {
+    $crc = crc32($content);
+    $uLen = strlen($content);
+    $comp = gzdeflate($content, 6);
+    $cLen = strlen($comp);
+    $fnLen = strlen($entryName);
+    $localHdr = pack('VvvvvvVVVvv', 0x04034b50, 20, 0, 8, 0, 0, $crc, $cLen, $uLen, $fnLen, 0) . $entryName;
+    $cdOffset = strlen($localHdr) + $cLen;
+    $cdHdr = pack('VvvvvvvVVVvvvvvVV', 0x02014b50, 20, 20, 0, 8, 0, 0, $crc, $cLen, $uLen, $fnLen, 0, 0, 0, 0, 0, 0) . $entryName;
+    $eocd = pack('VvvvvVVv', 0x06054b50, 0, 0, 1, 1, strlen($cdHdr), $cdOffset, 0);
+    return $localHdr . $comp . $cdHdr . $eocd;
+}
+
+/** Extract the first file from a raw Gzip (.gz), PKZIP (.zip), or plain text payload. */
+function decode_archive_payload(string $raw, string $filename = ''): string {
+    // 1. Check Gzip magic bytes (\x1f\x8b)
+    if (str_starts_with($raw, "\x1f\x8b")) {
+        $dec = @gzdecode($raw);
+        if ($dec === false) fail('Failed to decompress Gzip (.gz) file');
+        return $dec;
+    }
+    // 2. Check PKZIP magic bytes (PK\x03\x04)
+    if (str_starts_with($raw, "PK\x03\x04")) {
+        if (strlen($raw) < 30) fail('Invalid or truncated ZIP archive');
+        $hdr = unpack('Vsig/vver/vflag/vmeth/vmtime/vmdate/Vcrc/Vcsize/Vusize/vfnlen/vexlen', substr($raw, 0, 30));
+        $dataOffset = 30 + $hdr['fnlen'] + $hdr['exlen'];
+        $csize = $hdr['csize'];
+        // If bit 3 (data descriptor) is set and local header csize is 0, read sizes from Central Directory
+        if ($csize === 0 && ($hdr['flag'] & 8)) {
+            $cdPos = strpos($raw, "PK\x01\x02");
+            if ($cdPos !== false && strlen($raw) >= $cdPos + 46) {
+                $cd = unpack('Vsig/vver/vver2/vflag/vmeth/vmtime/vmdate/Vcrc/Vcsize/Vusize', substr($raw, $cdPos, 28));
+                $csize = $cd['csize'];
+            }
+        }
+        $compData = substr($raw, $dataOffset, $csize);
+        if ($hdr['meth'] === 0) return $compData; // STORED
+        if ($hdr['meth'] === 8) {                 // DEFLATED
+            $dec = @gzinflate($compData);
+            if ($dec === false) fail('Failed to inflate entry inside ZIP archive');
+            return $dec;
+        }
+        fail("Unsupported ZIP compression method ({$hdr['meth']}); use standard Deflate or Store");
+    }
+    return $raw;
+}
+
+/** Split a SQL script into individual statements outside quotes and comments. */
+function split_sql_statements(string $sql, string $drv): array {
+    if (str_starts_with($sql, "\xEF\xBB\xBF")) $sql = substr($sql, 3);
+    $stmts = []; $buf = ''; $qt = null;
+    for ($i = 0, $n = strlen($sql); $i < $n; $i++) {
+        $ch = $sql[$i];
+        if ($qt) {
+            if ($ch === '\\' && $qt !== '`' && $drv === 'mysql') { $buf .= $ch . ($sql[++$i] ?? ''); continue; }
+            if ($ch === $qt) {
+                if (($qt === "'" || $qt === '"' || $qt === '`') && ($sql[$i + 1] ?? '') === $qt) { $buf .= $ch . $sql[++$i]; continue; }
+                $qt = null;
+            }
+            $buf .= $ch;
+            continue;
+        }
+        if ($ch === '-' && ($sql[$i + 1] ?? '') === '-') {
+            $nl = strpos($sql, "\n", $i + 2);
+            if ($nl === false) break;
+            $buf .= "\n"; $i = $nl; continue;
+        }
+        if ($ch === '#' && $drv === 'mysql') {
+            $nl = strpos($sql, "\n", $i + 1);
+            if ($nl === false) break;
+            $buf .= "\n"; $i = $nl; continue;
+        }
+        if ($ch === '/' && ($sql[$i + 1] ?? '') === '*') {
+            $end = strpos($sql, '*/', $i + 2);
+            if ($end === false) break;
+            $i = $end + 1; continue;
+        }
+        if ($ch === "'" || $ch === '"' || $ch === '`') $qt = $ch;
+        elseif ($ch === ';') { if (trim($buf) !== '') $stmts[] = $buf; $buf = ''; continue; }
+        $buf .= $ch;
+    }
+    if (trim($buf) !== '') $stmts[] = $buf;
+    return $stmts;
+}
+
+$rawBody = file_get_contents('php://input') ?: '';
+$in = (!empty($_POST) && empty($rawBody)) ? $_POST : (json_decode($rawBody ?: '{}', true) ?: []);
 $a = $_GET['a'] ?? '';
 
 if ($a === 'session') {
@@ -1475,40 +1562,45 @@ try {
 
     case 'query':
         $results = [];
-        // split on ; outside quotes and SQL comments
-        $stmts = []; $buf = ''; $qt = null; $sql = (string)$in['sql'];
-        for ($i = 0, $n = strlen($sql); $i < $n; $i++) {
-            $ch = $sql[$i];
-            if ($qt) {
-                if ($ch === '\\' && $qt !== '`' && $drv === 'mysql') { $buf .= $ch . ($sql[++$i] ?? ''); continue; }
-                if ($ch === $qt) {
-                    if (($qt === "'" || $qt === '"' || $qt === '`') && ($sql[$i + 1] ?? '') === $qt) { $buf .= $ch . $sql[++$i]; continue; }
-                    $qt = null;
-                }
-                $buf .= $ch;
-                continue;
-            }
-            if ($ch === '-' && ($sql[$i + 1] ?? '') === '-') {
-                $nl = strpos($sql, "\n", $i + 2);
-                if ($nl === false) break;
-                $buf .= "\n"; $i = $nl; continue;
-            }
-            if ($ch === '/' && ($sql[$i + 1] ?? '') === '*') {
-                $end = strpos($sql, '*/', $i + 2);
-                if ($end === false) break;
-                $i = $end + 1; continue;
-            }
-            if ($ch === "'" || $ch === '"' || $ch === '`') $qt = $ch;
-            elseif ($ch === ';') { if (trim($buf) !== '') $stmts[] = $buf; $buf = ''; continue; }
-            $buf .= $ch;
-        }
-        if (trim($buf) !== '') $stmts[] = $buf;
+        $stmts = split_sql_statements((string)($in['sql'] ?? ''), $drv);
         $maxRows = (int)($in['max_rows'] ?? 1000);
         foreach ($stmts as $st) {
             try { $r = run_sql($p, $st, $maxRows); $r['sql'] = trim($st); $results[] = $r; }
             catch (Throwable $e) { $results[] = ['sql' => trim($st), 'error' => $e->getMessage()]; break; }
         }
         out(['results' => $results]);
+
+    case 'import_sql_file':
+        if (empty($_FILES['file']['tmp_name']) || !is_uploaded_file($_FILES['file']['tmp_name'])) {
+            fail('No SQL file uploaded (check upload_max_filesize in php.ini if the file is very large)');
+        }
+        $origName = (string)($_FILES['file']['name'] ?? 'import.sql');
+        $rawBytes = @file_get_contents($_FILES['file']['tmp_name']);
+        if ($rawBytes === false) fail('Unable to read uploaded file');
+        $sqlText = decode_archive_payload($rawBytes, $origName);
+        unset($rawBytes);
+        $stmts = split_sql_statements($sqlText, $drv);
+        unset($sqlText);
+        $executed = 0;
+        foreach ($stmts as $st) {
+            try {
+                $p->exec($st);
+                $executed++;
+            } catch (Throwable $e) {
+                out(['ok' => false, 'executed' => $executed, 'total' => count($stmts), 'error' => $e->getMessage(), 'failed_sql' => substr(trim($st), 0, 300)]);
+            }
+        }
+        out(['ok' => true, 'executed' => $executed, 'total' => count($stmts)]);
+
+    case 'decompress_file':
+        if (empty($_FILES['file']['tmp_name']) || !is_uploaded_file($_FILES['file']['tmp_name'])) {
+            fail('No file uploaded');
+        }
+        $origName = (string)($_FILES['file']['name'] ?? 'file.csv');
+        $rawBytes = @file_get_contents($_FILES['file']['tmp_name']);
+        if ($rawBytes === false) fail('Unable to read uploaded file');
+        $text = decode_archive_payload($rawBytes, $origName);
+        out(['ok' => true, 'text' => $text, 'name' => preg_replace('/\.(gz|zip)$/i', '', $origName)]);
 
     case 'drop_table':
         $isV = $drv === 'sqlite'
@@ -1695,15 +1787,36 @@ try {
         [$where, $order] = filter_sql($drv, $cols, $in, $fargs);
         $delim = in_array($in['delimiter'] ?? ',', [',', ';', "\t", '|'], true) ? ($in['delimiter'] ?? ',') : ',';
         $nullStr = (string)($in['null_as'] ?? '');
+        $comp = strtolower((string)($in['compress'] ?? 'none')); // none | gzip | zip
+        $baseName = preg_replace('/[^\w.-]+/', '_', (string)$tb) . '.csv';
         if ($drv === 'mysql') $p->setAttribute(defined('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') ? constant('Pdo\Mysql::ATTR_USE_BUFFERED_QUERY') : 1000, false);
         $st = $p->prepare("SELECT * FROM $T$where$order"); $st->execute($fargs);
         header_remove('Content-Type');
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="' . preg_replace('/[^\w.-]+/', '_', (string)$tb) . '.csv"');
+        if ($comp === 'none') {
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $baseName . '"');
+            $fh = fopen('php://output', 'w');
+            if (!empty($in['bom'])) fwrite($fh, "\xEF\xBB\xBF");
+            if (!empty($in['header'])) fputcsv($fh, $cols, $delim, '"', '');
+            while ($r = $st->fetch(PDO::FETCH_NUM)) fputcsv($fh, array_map(fn($v) => $v === null ? $nullStr : $v, $r), $delim, '"', '');
+            exit;
+        }
+        ob_start();
         $fh = fopen('php://output', 'w');
         if (!empty($in['bom'])) fwrite($fh, "\xEF\xBB\xBF");
         if (!empty($in['header'])) fputcsv($fh, $cols, $delim, '"', '');
         while ($r = $st->fetch(PDO::FETCH_NUM)) fputcsv($fh, array_map(fn($v) => $v === null ? $nullStr : $v, $r), $delim, '"', '');
+        fclose($fh);
+        $csvData = (string)ob_get_clean();
+        if ($comp === 'gzip') {
+            header('Content-Type: application/gzip');
+            header('Content-Disposition: attachment; filename="' . $baseName . '.gz"');
+            echo gzencode($csvData, 6);
+        } elseif ($comp === 'zip') {
+            header('Content-Type: application/zip');
+            header('Content-Disposition: attachment; filename="' . $baseName . '.zip"');
+            echo build_single_file_zip($baseName, $csvData);
+        }
         exit;
 
     case 'import_rows':
@@ -1735,12 +1848,15 @@ try {
         $tables = $in['tables'] ?? [];
         $wantStruct = !empty($in['structure']);
         $wantData = !empty($in['data']);
+        $includeCreateDb = !empty($in['create_db']);
+        $comp = strtolower((string)($in['compress'] ?? 'none')); // none | gzip | zip
         $stream = ($a === 'export_sql') || !empty($in['stream']);
-        if ($stream) {
+        $fileLabel = (count($tables) === 1 && $tb) ? $tb : ($db ?: 'fandejo');
+        $baseName = preg_replace('/[^\w.-]+/', '_', (string)$fileLabel) . '.sql';
+        if ($stream && $comp === 'none') {
             header_remove('Content-Type');
             header('Content-Type: application/sql; charset=utf-8');
-            $fname = preg_replace('/[^\w.-]+/', '_', (string)($tb ?: ($db ?: 'fandejo'))) . '.sql';
-            header('Content-Disposition: attachment; filename="' . $fname . '"');
+            header('Content-Disposition: attachment; filename="' . $baseName . '"');
             $fh = fopen('php://output', 'w');
             $emit = function (string $chunk) use ($fh): void { fwrite($fh, $chunk); };
         } else {
@@ -1750,6 +1866,12 @@ try {
 
         $emit("-- Fandejo SQL Export\n-- Engine: $drv | Database: " . ($db ?? 'main') . "\n-- Generated: " . date('c') . "\n\n");
         $emit($drv === 'mysql' ? "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n" : "PRAGMA foreign_keys=OFF;\n\n");
+        if ($drv === 'mysql' && $includeCreateDb && $db) {
+            $qd = q((string)$db, 'mysql');
+            $createDbSql = rows($p, "SHOW CREATE DATABASE $qd")[0]['Create Database'] ?? "CREATE DATABASE $qd";
+            $createDbSql = preg_replace('/^CREATE DATABASE\s+/i', 'CREATE DATABASE IF NOT EXISTS ', $createDbSql);
+            $emit("$createDbSql;\nUSE $qd;\n\n");
+        }
 
         $viewsQueue = [];
         foreach ($tables as $t) {
@@ -1827,6 +1949,20 @@ try {
         $emit($drv === 'mysql' ? "SET FOREIGN_KEY_CHECKS=1;\n" : "PRAGMA foreign_keys=ON;\n");
 
         if ($stream) {
+            if ($comp === 'gzip') {
+                header_remove('Content-Type');
+                header('Content-Type: application/gzip');
+                header('Content-Disposition: attachment; filename="' . $baseName . '.gz"');
+                echo gzencode($buf, 6);
+                exit;
+            }
+            if ($comp === 'zip') {
+                header_remove('Content-Type');
+                header('Content-Type: application/zip');
+                header('Content-Disposition: attachment; filename="' . $baseName . '.zip"');
+                echo build_single_file_zip($baseName, $buf);
+                exit;
+            }
             fclose($fh);
             exit;
         }

@@ -2,7 +2,7 @@
 // Unit test for MySQL column-definition builder. Run: php tests/coldef.php
 $src = file_get_contents(__DIR__ . '/../public/api.php');
 function q(string $id, string $drv): string { return '`' . str_replace('`', '``', $id) . '`'; }
-preg_match('/(const COL_TYPES.*?)\n\$in = json_decode/s', $src, $m); eval($m[1]);
+preg_match('/(const COL_TYPES.*?)\n\$rawBody = /s', $src, $m); eval($m[1]);
 $p = new PDO('sqlite::memory:');
 $t = [
   [['type' => 'varchar', 'length' => '255', 'collation' => 'utf8mb4_unicode_ci', 'default_mode' => 'value', 'default' => "it's", 'comment' => 'x', 'after' => 'id'], "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'it''s' COMMENT 'x'"],
