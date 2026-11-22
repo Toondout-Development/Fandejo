@@ -62,13 +62,57 @@ function modal(html, onSubmit) {
 }
 const confirmDo = (msg, fn) => modal(`<h3>Confirm</h3><p>${esc(msg)}</p>`, fn);
 
-/* ---------- boot / login ---------- */
+/* ---------- URL hash routing & boot / login ---------- */
+let suppressHashSync = false;
+function buildHash() {
+    const enc = encodeURIComponent;
+    if (!S.db) return '#' + enc(S.tab || 'home');
+    if (!S.table) return '#' + enc(S.db) + '//' + enc(S.tab || 'tables');
+    return '#' + enc(S.db) + '/' + enc(S.table) + '/' + enc(S.tab || 'browse');
+}
+function syncHash() {
+    if (suppressHashSync) return;
+    const h = buildHash();
+    if (location.hash !== h) history.pushState(null, '', h);
+}
+async function applyHashState() {
+    const raw = location.hash.replace(/^#/, '');
+    if (!raw) return;
+    const parts = raw.split('/').map(s => { try { return decodeURIComponent(s); } catch { return s; } });
+    if (parts.length === 1) {
+        S.db = null; S.table = null; S.tab = parts[0] || 'home';
+    } else {
+        const [db, tb, tab] = parts;
+        if (db && S.dbs.some(d => d.name === db)) {
+            S.db = db;
+            if (!S.tables[S.db]) await loadTables(S.db);
+            S.table = (tb && (S.tables[S.db] || []).some(t => t.name === tb)) ? tb : null;
+            S.tab = tab || (S.table ? 'browse' : 'tables');
+        } else {
+            S.db = null; S.table = null; S.tab = 'home';
+        }
+    }
+}
+window.addEventListener('hashchange', guard(async () => {
+    if (!S.driver) return;
+    suppressHashSync = true;
+    try {
+        await applyHashState();
+        render();
+    } finally {
+        suppressHashSync = false;
+    }
+}));
+
 async function boot() {
     const s = await (await fetch('api.php?a=session')).json();
     if (!s.auth) return loginView(s);
     csrf = (await (await fetch('api.php?a=csrf')).json()).csrf;
     S.driver = s.driver; S.user = s.user; S.sqliteDirs = s.sqlite_dirs || [];
-    await loadDbs(); layout();
+    await loadDbs();
+    suppressHashSync = true;
+    try { await applyHashState(); } finally { suppressHashSync = false; }
+    layout();
 }
 function loginView(s = {}) {
     const needSetup = !!s.sqlite_setup;
@@ -195,6 +239,7 @@ function render() {
         : S.db ? [['tables', 'Tables'], ['sql', 'SQL'], ['newtable', 'New table'], ['routines', S.driver === 'mysql' ? 'Views / Routines / Triggers' : 'Views & Triggers'], ['export', 'Export'], ['import', 'Import'], ['dropdb', 'Operations']]
             : [['home', 'Dashboard'], ...(S.driver === 'mysql' ? [['processes', 'Processes']] : []), ['users', 'Users'], ['sql', 'SQL'], ['export', 'Export DB'], ['import', 'Import DB']];
     if (!tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
+    syncHash();
     $('#tabs').innerHTML = tabs.map(([k, l]) => `<div class="tab ${S.tab === k ? 'active' : ''}" data-k="${k}">${l}</div>`).join('');
     $('#tabs').querySelectorAll('.tab').forEach(t => t.onclick = () => { S.tab = t.dataset.k; render(); });
     const view = { home: dbsHome, processes: processesView, browse, structure, sql: sqlView, insert: insertView, ops, tables: tablesView, newtable: newTable, routines: dbObjectsView, export: exportView, import: importView, dropdb, users }[S.tab];
@@ -1158,6 +1203,49 @@ function columnEditor(cols, col) {
 const loadJSON = (k, def = []) => { try { return JSON.parse(localStorage[k] || '') || def; } catch { return def; } };
 const saveJSON = (k, v) => { localStorage[k] = JSON.stringify(v); };
 
+const SQL_KW = ['SELECT', 'FROM', 'WHERE', 'LEFT JOIN', 'RIGHT JOIN', 'INNER JOIN', 'JOIN', 'ON', 'GROUP BY', 'HAVING', 'ORDER BY', 'LIMIT', 'OFFSET', 'INSERT INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE FROM', 'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'UNION ALL', 'UNION', 'AND', 'OR', 'AS', 'IN', 'IS NULL', 'IS NOT NULL', 'ASC', 'DESC', 'DISTINCT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'COALESCE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END'];
+function formatSqlText(sql) {
+    let out = '';
+    let i = 0, n = sql.length, qt = null;
+    while (i < n) {
+        const ch = sql[i];
+        if (qt) {
+            out += ch;
+            if (ch === '\\' && qt !== '`') { if (i + 1 < n) out += sql[++i]; }
+            else if (ch === qt) {
+                if (sql[i + 1] === qt) out += sql[++i];
+                else qt = null;
+            }
+            i++;
+            continue;
+        }
+        if (ch === "'" || ch === '"' || ch === '`') { qt = ch; out += ch; i++; continue; }
+        if (ch === '-' && sql[i + 1] === '-') {
+            const nl = sql.indexOf('\n', i + 2);
+            if (nl === -1) { out += sql.slice(i); break; }
+            out += sql.slice(i, nl + 1);
+            i = nl + 1;
+            continue;
+        }
+        if (/\s/.test(ch)) {
+            while (i < n && /\s/.test(sql[i])) i++;
+            out += ' ';
+            continue;
+        }
+        out += ch;
+        i++;
+    }
+    for (const kw of SQL_KW) {
+        const re = new RegExp('\\b' + kw.replace(/\s+/g, '\\s+') + '\\b', 'gi');
+        out = out.replace(re, kw);
+    }
+    out = out
+        .replace(/\s+\b(FROM|WHERE|LEFT JOIN|RIGHT JOIN|INNER JOIN|JOIN|GROUP BY|HAVING|ORDER BY|LIMIT|VALUES|SET|UNION ALL|UNION)\b/g, '\n$1')
+        .replace(/\s+\b(AND|OR)\b/g, '\n  $1')
+        .replace(/;\s*/g, ';\n\n');
+    return out.trim();
+}
+
 async function sqlView() {
     const qId = id => S.driver === 'mysql' ? '`' + id.replace(/`/g, '``') + '`' : '"' + id.replace(/"/g, '""') + '"';
     const def = S.sql || (S.table ? `SELECT * FROM ${qId(S.table)} LIMIT 50;` : '');
@@ -1173,16 +1261,18 @@ async function sqlView() {
           <button type="button" class="preset" data-s="del">DELETE</button>
           ${tcols.length ? `<span class="badge" style="align-self:center;margin-left:4px">Columns (click to insert):</span>` + tcols.map(c => `<button type="button" class="chip" style="cursor:pointer" data-col="${esc(c.name)}" title="${esc(c.type)}">${esc(c.name)}</button>`).join('') : ''}
         </div>` : ''}
-        <textarea class="editor" id="ed" spellcheck="false" placeholder="Write SQL… (Ctrl+Enter to run, or select part of the text to run only the selection)">${esc(def)}</textarea>
+        <textarea class="editor" id="ed" spellcheck="false" placeholder="Write SQL… (Ctrl+Enter to run, Tab to indent, or select part of the text to run only the selection)">${esc(def)}</textarea>
         <div class="bar" style="margin-top:8px">
           <button class="primary" id="run">▶ Run</button>
+          <button id="expq" title="Run EXPLAIN / EXPLAIN QUERY PLAN on current query">🔍 Explain</button>
+          <button id="fmtq" title="Format SQL keywords and clause line breaks">✨ Format</button>
           <button id="saveq">★ Save query</button>
           <button id="clearq" class="ghost">Clear</button>
           <label class="row" style="font-size:12px;color:var(--mute);margin-left:6px">Max rows
             <select id="sql-max">${[100, 500, 1000, 5000].map(n => `<option value="${n}" ${n === (S.sqlMaxRows || 1000) ? 'selected' : ''}>${n}</option>`).join('')}</select>
           </label>
           <span class="spacer"></span>
-          <small style="color:var(--mute)">Ctrl+Enter to execute</small>
+          <small style="color:var(--mute)">Ctrl+Enter to execute · Tab to indent</small>
         </div>
         <div id="res"></div>
       </div>
@@ -1296,11 +1386,47 @@ async function sqlView() {
     });
 
     $('#run').onclick = () => runSql();
+    $('#expq').onclick = () => {
+        const sel = ed.value.slice(ed.selectionStart, ed.selectionEnd).trim();
+        const raw = (sel || ed.value).trim();
+        if (!raw) return toast('Enter a SQL query to explain', true);
+        const prefix = S.driver === 'sqlite' ? 'EXPLAIN QUERY PLAN ' : 'EXPLAIN ';
+        const q = /^\s*explain\b/i.test(raw) ? raw : prefix + raw;
+        runSql(q);
+    };
+    $('#fmtq').onclick = () => {
+        if (!ed.value.trim()) return;
+        ed.value = S.sql = formatSqlText(ed.value);
+        ed.focus();
+    };
     if ($('#sql-max')) $('#sql-max').onchange = e => { S.sqlMaxRows = +e.target.value; };
     $('#saveq').onclick = () => promptSave(ed.value);
     $('#clearq').onclick = () => { ed.value = S.sql = ''; ed.focus(); };
     ed.oninput = () => { S.sql = ed.value; };
-    ed.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runSql(); } };
+    ed.onkeydown = e => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runSql(); }
+        else if (e.key === 'Tab') {
+            e.preventDefault();
+            const start = ed.selectionStart, end = ed.selectionEnd, val = ed.value;
+            if (start !== end && val.slice(start, end).includes('\n')) {
+                const lineStart = val.lastIndexOf('\n', start - 1) + 1;
+                const block = val.slice(lineStart, end);
+                const replaced = e.shiftKey
+                    ? block.replace(/^ {1,2}|\t/gm, '')
+                    : block.replace(/^/gm, '  ');
+                ed.value = S.sql = val.slice(0, lineStart) + replaced + val.slice(end);
+                ed.setSelectionRange(lineStart, lineStart + replaced.length);
+            } else if (e.shiftKey) {
+                const lineStart = val.lastIndexOf('\n', start - 1) + 1;
+                if (val.slice(lineStart, lineStart + 2) === '  ') {
+                    ed.value = S.sql = val.slice(0, lineStart) + val.slice(lineStart + 2);
+                    ed.setSelectionRange(Math.max(lineStart, start - 2), Math.max(lineStart, end - 2));
+                }
+            } else {
+                insertAtCursor('  ');
+            }
+        }
+    };
     C().querySelectorAll('[data-st]').forEach(b => b.onclick = () => { S.sqlSide = b.dataset.st; render(); });
     $('#qf').oninput = e => { S.qFilter = e.target.value; drawSide(); };
     if ($('#clrhist')) $('#clrhist').onclick = () => confirmDo('Clear all query history?', async () => { saveJSON('fandejo_history', []); drawSide(); });
