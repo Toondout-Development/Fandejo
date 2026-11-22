@@ -1,5 +1,5 @@
 Fandejo Source-Available & Free-Use License
-Copyright (c) 2026 Toondout (https://toondout.com)
+Copyright (c) 2026 Toondout Development (https://toondout.com)
 Canonical Repository: https://github.com/Toondout-Development/Fandejo
 All rights reserved except as expressly granted below.
 
@@ -12,7 +12,7 @@ internal business, or commercial database administration purposes.
 You may fork the canonical repository on GitHub for the purposes of:
   (a) personal or internal deployment within your own infrastructure, and
   (b) developing, testing, and submitting Pull Requests, bug fixes, or enhancements
-      back to the canonical Toondout repository (https://github.com/Toondout-Development/Fandejo).
+      back to the canonical Toondout Development repository (https://github.com/Toondout-Development/Fandejo).
 
 3. No Public Redistribution or Rebranding
 Except for Pull Requests and personal/internal forks as permitted in Section 2,
@@ -20,17 +20,17 @@ you may NOT redistribute, republish, sublicense, sell, or distribute modified or
 unmodified copies of the Software, nor distribute rebranded derivatives or forks
 under a different project or organization name, nor offer the Software as a
 managed or hosted third-party service (SaaS), without prior written permission
-from Toondout.
+from Toondout Development.
 
 4. Attribution & Notice Integrity
 All copyright notices, license files (LICENSE), version identifiers (VERSION),
-and "Toondout" attribution links in the source code and user interface must be
+and "Toondout Development" attribution links in the source code and user interface must be
 retained intact in all copies and deployments of the Software.
 
 5. Disclaimer of Warranty & Limitation of Liability
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
-TOONDOUT OR THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+TOONDOUT DEVELOPMENT OR THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
 OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
