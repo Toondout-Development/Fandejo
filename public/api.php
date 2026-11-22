@@ -29,7 +29,10 @@ if (PHP_SAPI === 'cli' && isset($argv[1]) && str_starts_with($argv[1], '--unlock
 ini_set('session.use_strict_mode', '1');
 ini_set('session.use_only_cookies', '1');
 $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
-session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
+$scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+$cookiePath = ($scriptDir !== '' && $scriptDir !== '.' && str_starts_with($scriptDir, '/')) ? $scriptDir . '/' : '/';
+session_name('fandejo_sid');
+session_set_cookie_params(['lifetime' => 0, 'path' => $cookiePath, 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
 session_start();
 header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
@@ -42,12 +45,12 @@ function fail(string $m, int $code = 400): never { out(['error' => $m], $code); 
 
 /** Encrypt plaintext DB password using a split key stored only in an HttpOnly browser cookie. */
 function seal_secret(string $plain): string {
-    global $isHttps;
+    global $isHttps, $cookiePath;
     $key = sodium_crypto_secretbox_keygen();
     $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
     $cipher = sodium_crypto_secretbox($plain, $nonce, $key);
     $hexKey = sodium_bin2hex($key);
-    setcookie('fandejo_key', $hexKey, ['expires' => 0, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
+    setcookie('fandejo_key', $hexKey, ['expires' => 0, 'path' => $cookiePath, 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
     $_COOKIE['fandejo_key'] = $hexKey;
     return sodium_bin2hex($nonce . $cipher);
 }
@@ -65,10 +68,12 @@ function open_secret(string $sealed): ?string {
     } catch (Throwable) { return null; }
 }
 function clear_auth(): void {
-    global $isHttps;
+    global $isHttps, $cookiePath;
     $_SESSION = [];
-    setcookie('fandejo_key', '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
-    setcookie('typhon_key', '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
+    foreach (array_unique([$cookiePath, '/']) as $cp) {
+        setcookie('fandejo_key', '', ['expires' => time() - 3600, 'path' => $cp, 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
+        setcookie('typhon_key', '', ['expires' => time() - 3600, 'path' => $cp, 'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Strict']);
+    }
     if (session_status() === PHP_SESSION_ACTIVE) session_destroy();
 }
 function session_fingerprint(): string {
@@ -83,6 +88,15 @@ function q(string $id, string $drv): string {
 }
 
 const SQLITE_EXTS = ['sqlite', 'sqlite3', 'db'];
+
+function fandejo_version(): string {
+    $vf = dirname(__DIR__) . '/VERSION';
+    if (is_file($vf)) {
+        $v = trim((string)@file_get_contents($vf));
+        if ($v !== '') return $v;
+    }
+    return 'v1.0.0';
+}
 
 /** Load config.php (from project root or public/, or FANDEJO_CONFIG env var) combined with sensible defaults. */
 function fandejo_config(): array {
@@ -941,6 +955,7 @@ if ($a === 'session') {
     if (!$ok && isset($_SESSION['c'])) clear_auth();
     out([
         'auth' => $ok,
+        'version' => fandejo_version(),
         'driver' => $ok ? $_SESSION['c']['driver'] : null,
         'user' => $ok ? $_SESSION['c']['user'] : null,
         'sqlite_setup' => empty($cfg['sqlite_users']),
@@ -1107,6 +1122,7 @@ try {
         out(['ok' => true, 'dirs' => $clean]);
     case 'server_info':
         $info = [
+            'version' => fandejo_version(),
             'driver' => $drv,
             'php_version' => PHP_VERSION,
             'php_sapi' => PHP_SAPI,

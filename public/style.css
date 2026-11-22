@@ -55,6 +55,9 @@ aside{background:var(--panel);border-right:1px solid var(--line);display:flex;fl
 aside .head{padding:14px;display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:16px;letter-spacing:-.01em}
 aside .search{margin:0 12px 8px}
 aside .tree{overflow:auto;flex:1;padding:0 8px 12px}
+.brand-foot{font-size:11px;color:var(--mute);display:flex;justify-content:space-between;align-items:center;gap:6px;padding-top:8px;border-top:1px solid var(--line)}
+.brand-foot a{color:var(--mute);text-decoration:none}
+.brand-foot a:hover{color:var(--accent);text-decoration:underline}
 .node{padding:5px 10px;border-radius:7px;cursor:pointer;display:flex;justify-content:space-between;gap:8px;white-space:nowrap}
 .node:hover{background:var(--panel2)}
 .node.active{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
